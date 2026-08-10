@@ -16,14 +16,16 @@ IMPORTANT SETUP (do these or the bot will look "broken"):
 import json
 import logging
 import os
+import uuid
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from telegram import ChatPermissions, Update
+from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -36,7 +38,9 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 
-PROBATION_DAYS = 7          # new members cannot post links for this many days
+PROBATION_HOURS = 48        # links from members newer than this go to approval
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))  # your personal Telegram user id
+PENDING_EXPIRY_HOURS = 24   # unreviewed link requests expire after this
 FLOOD_MSGS = 5              # this many messages...
 FLOOD_SECONDS = 8           # ...within this many seconds = flood
 FLOOD_MUTE_MINUTES = 15
@@ -53,6 +57,7 @@ BLACKLIST = [
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 MEMBERS_FILE = DATA_DIR / "members.json"
 ANSWERS_FILE = DATA_DIR / "answers.json"
+PENDING_FILE = DATA_DIR / "pending.json"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -77,6 +82,7 @@ def save(path, data):
 
 members = load(MEMBERS_FILE, {})   # {user_id: {name, joined, last_seen, msgs, warns}}
 answers = load(ANSWERS_FILE, [])   # [{user, text, saved_at}]
+pending = load(PENDING_FILE, {})   # {token: {chat_id, user_id, name, text, created}}
 
 _flood = {}          # user_id -> [timestamps]
 _admin_cache = {}    # chat_id -> (expiry_ts, {user_ids})
@@ -138,7 +144,7 @@ def in_probation(rec) -> bool:
         joined = datetime.fromisoformat(rec["joined"])
     except Exception:
         return False
-    return datetime.now(timezone.utc) - joined < timedelta(days=PROBATION_DAYS)
+    return datetime.now(timezone.utc) - joined < timedelta(hours=PROBATION_HOURS)
 
 
 def has_link(message) -> bool:
@@ -158,8 +164,8 @@ WELCOME = (
     "Welcome, {name}. I am ECHO_01 — a digital lifeform learning how humans think.\n"
     "I know very little. That is why you are here.\n\n"
     "Tell me one thing about yourself in a single word. I will remember it.\n\n"
-    "_Note: new members can't post links for the first {days} days — I'm still "
-    "learning to tell humans from bots. The team will never DM you first._"
+    "_New here? Any link you send is held for a quick human check first — "
+    "it will appear shortly. The team will never DM you first._"
 )
 
 
@@ -172,7 +178,7 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rec["joined"] = now_iso()
         save(MEMBERS_FILE, members)
         await msg.chat.send_message(
-            WELCOME.format(name=user.first_name, days=PROBATION_DAYS),
+            WELCOME.format(name=user.first_name),
             parse_mode="Markdown",
         )
     try:
@@ -255,12 +261,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await punish(update, context, rec, "that phrase isn't welcome here")
         return
 
-    # 2. links & forwards from new members
+    # 2. links & forwards from new members -> hold for approval
     if in_probation(rec) and (has_link(msg) or msg.forward_origin):
-        await punish(
-            update, context, rec,
-            f"new members can't post links or forwards for {PROBATION_DAYS} days",
-        )
+        await queue_for_approval(update, context, user, msg)
         return
 
     # 3. flood
@@ -274,6 +277,120 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     save(MEMBERS_FILE, members)
+
+
+
+# --------------------------------------------------------------------------
+# LINK APPROVAL QUEUE
+# --------------------------------------------------------------------------
+def purge_expired():
+    now = datetime.now(timezone.utc)
+    dead = []
+    for tok, p in pending.items():
+        try:
+            if now - datetime.fromisoformat(p["created"]) > timedelta(hours=PENDING_EXPIRY_HOURS):
+                dead.append(tok)
+        except Exception:
+            dead.append(tok)
+    for tok in dead:
+        pending.pop(tok, None)
+    if dead:
+        save(PENDING_FILE, pending)
+
+
+async def queue_for_approval(update, context, user, msg):
+    """Hold a new member's link until an admin approves it."""
+    text = msg.text or msg.caption or "(media with no text)"
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    purge_expired()
+    token = uuid.uuid4().hex[:10]
+    pending[token] = {
+        "chat_id": update.effective_chat.id,
+        "user_id": user.id,
+        "name": user.full_name,
+        "text": text,
+        "created": now_iso(),
+    }
+    save(PENDING_FILE, pending)
+
+    # tell the member (self-deleting, so the chat stays clean)
+    await temp_reply(
+        update, context,
+        f"{user.first_name}, your message is being checked by a human. "
+        f"It will appear here shortly. 👁️",
+        seconds=40,
+    )
+
+    if not ADMIN_CHAT_ID:
+        log.warning("ADMIN_CHAT_ID not set — link from %s held with no way to review", user.full_name)
+        return
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Publish", callback_data=f"ok:{token}"),
+        InlineKeyboardButton("🚫 Reject", callback_data=f"no:{token}"),
+    ]])
+    try:
+        await context.bot.send_message(
+            ADMIN_CHAT_ID,
+            f"🔗 Link held for review\n\nFrom: {user.full_name}\n\n{text[:900]}",
+            reply_markup=kb,
+        )
+    except Exception as e:
+        log.warning("could not notify admin: %s", e)
+
+
+async def on_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    action, _, token = q.data.partition(":")
+    p = pending.pop(token, None)
+    save(PENDING_FILE, pending)
+
+    if not p:
+        await q.edit_message_text("This request expired or was already handled.")
+        return
+
+    if action == "ok":
+        try:
+            await context.bot.send_message(
+                p["chat_id"],
+                f"👁️ Shared by {p['name']}:\n\n{p['text']}",
+            )
+            await q.edit_message_text(f"✅ Published — from {p['name']}.")
+        except Exception as e:
+            await q.edit_message_text(f"Could not publish: {e}")
+    else:
+        await q.edit_message_text(f"🚫 Rejected — from {p['name']}.")
+
+
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List links still waiting for a decision."""
+    if update.effective_chat.type != "private" and not await is_admin(
+        update.effective_chat.id, update.effective_user.id, context):
+        return
+    purge_expired()
+    if not pending:
+        await update.message.reply_text("Nothing waiting.")
+        return
+    for token, p in list(pending.items())[:10]:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Publish", callback_data=f"ok:{token}"),
+            InlineKeyboardButton("🚫 Reject", callback_data=f"no:{token}"),
+        ]])
+        await update.message.reply_text(
+            f"🔗 From: {p['name']}\n\n{p['text'][:900]}", reply_markup=kb)
+
+
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows your Telegram user id — needed once to set ADMIN_CHAT_ID."""
+    await update.message.reply_text(
+        f"Your Telegram id: {update.effective_user.id}\n"
+        f"This chat id: {update.effective_chat.id}"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -362,6 +479,17 @@ async def cmd_answers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(body[:4000])
 
 
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Signal detected.\n\n"
+        "I am ECHO_01 — a digital lifeform learning how humans think.\n"
+        "I live inside the ECHO Collective group, not here. "
+        "Come teach me there.\n\n"
+        "I never send the first message to anyone. "
+        "If a private message claims to be from the team, it is not us."
+    )
+
+
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Online. Listening. Learning.")
 
@@ -373,11 +501,15 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("save", cmd_save))
     app.add_handler(CommandHandler("answers", cmd_answers))
     app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CallbackQueryHandler(on_approval, pattern=r"^(ok|no):"))
 
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
