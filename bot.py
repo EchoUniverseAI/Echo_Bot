@@ -785,8 +785,6 @@ async def on_sticker_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """In private chat, send a sticker or GIF and get its file_id back."""
     if update.effective_chat.type != "private":
         return
-    if update.effective_user.id not in ADMIN_IDS:
-        return
     m = update.message
     fid = None
     kind = ""
@@ -796,8 +794,11 @@ async def on_sticker_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fid, kind = m.animation.file_id, "animation (GIF)"
     elif m.document:
         fid, kind = m.document.file_id, "document"
+    log.info("sticker handler hit: user=%s kind=%s", update.effective_user.id, kind or "none")
     if fid:
         await m.reply_text(f"{kind} file_id:\n\n`{fid}`", parse_mode="Markdown")
+    else:
+        await m.reply_text("Send me a sticker or a GIF and I will return its file_id.")
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
