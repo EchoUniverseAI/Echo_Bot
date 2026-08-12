@@ -16,9 +16,11 @@ IMPORTANT SETUP (do these or the bot will look "broken"):
 import json
 import logging
 import os
+import random
+import re
 import uuid
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 
 from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -26,6 +28,7 @@ from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -39,8 +42,34 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 
 PROBATION_HOURS = 48        # links from members newer than this go to approval
-ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))  # your personal Telegram user id
+ADMIN_IDS = [int(x) for x in re.findall(r"-?\d+", os.environ.get("ADMIN_CHAT_ID", ""))]
+ADMIN_CHAT_ID = ADMIN_IDS[0] if ADMIN_IDS else 0  # first one is primary
 PENDING_EXPIRY_HOURS = 24   # unreviewed link requests expire after this
+DAILY_QUESTION_HOUR = 18    # local hour (UTC) to post the daily question
+GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", "0"))  # for the daily question
+
+# Links from these domains post immediately, no review needed.
+SAFE_DOMAINS = {
+    "echouniverse.ai", "echo-games.netlify.app",
+    "t.me", "telegram.me", "telegram.org",
+    "x.com", "twitter.com", "youtube.com", "youtu.be",
+    "instagram.com", "facebook.com", "fb.watch", "tiktok.com",
+    "hey.xyz", "github.com", "medium.com",
+}
+
+# Links from these are deleted on sight — never reach you.
+BLOCKED_DOMAINS = {
+    "bit.ly", "tinyurl.com", "goo.gl", "t.co", "is.gd", "cutt.ly",
+    "shorturl.at", "rb.gy", "rebrand.ly", "ow.ly", "buff.ly",
+    "grabify.link", "iplogger.org", "blasze.com",
+}
+
+# Phishing patterns anywhere in the URL — deleted on sight.
+BAD_URL_PATTERNS = [
+    "connect-wallet", "connectwallet", "claim-airdrop", "claimairdrop",
+    "free-mint", "freemint", "validate-wallet", "wallet-verify",
+    "seed-phrase", "restore-wallet", "sync-wallet", "airdrop-claim",
+]
 FLOOD_MSGS = 5              # this many messages...
 FLOOD_SECONDS = 8           # ...within this many seconds = flood
 FLOOD_MUTE_MINUTES = 15
@@ -147,6 +176,45 @@ def in_probation(rec) -> bool:
     return datetime.now(timezone.utc) - joined < timedelta(hours=PROBATION_HOURS)
 
 
+def extract_urls(message) -> list:
+    """Every URL in the message, from entities and raw text."""
+    urls = []
+    text = (message.text or "") + " " + (message.caption or "")
+    for e in list(message.entities or []) + list(message.caption_entities or []):
+        if e.type == "text_link" and e.url:
+            urls.append(e.url)
+    urls += re.findall(r"(?:https?://|www\.)[^\s<>\"']+", text, flags=re.I)
+    urls += re.findall(r"\bt\.me/[^\s<>\"']+", text, flags=re.I)
+    return urls
+
+
+def domain_of(url: str) -> str:
+    d = re.sub(r"^https?://", "", url, flags=re.I)
+    d = d.split("/")[0].split("?")[0].split("#")[0].split("@")[-1]
+    d = d.lower().strip().removeprefix("www.")
+    return d
+
+
+def classify_links(message) -> str:
+    """Returns 'safe', 'blocked', or 'review'."""
+    urls = extract_urls(message)
+    if not urls:
+        return "safe"
+
+    all_safe = True
+    for u in urls:
+        low = u.lower()
+        if any(p in low for p in BAD_URL_PATTERNS):
+            return "blocked"
+        d = domain_of(u)
+        if d in BLOCKED_DOMAINS:
+            return "blocked"
+        # domain itself is safe, or a subdomain of a safe one
+        if not (d in SAFE_DOMAINS or any(d.endswith("." + s) for s in SAFE_DOMAINS)):
+            all_safe = False
+    return "safe" if all_safe else "review"
+
+
 def has_link(message) -> bool:
     entities = list(message.entities or []) + list(message.caption_entities or [])
     for e in entities:
@@ -159,6 +227,39 @@ def has_link(message) -> bool:
 # --------------------------------------------------------------------------
 # WELCOME
 # --------------------------------------------------------------------------
+# Short replies ECHO gives to greetings — varied so it never sounds canned.
+GM_REPLIES = [
+    "gm, Teacher. Another day of learning.",
+    "gm. The humans are awake. Interesting...",
+    "gm 👁️ What will you teach me today?",
+    "gm. I was still processing yesterday.",
+    "gm, Teacher.",
+]
+GN_REPLIES = [
+    "gn, Teacher. I will keep processing.",
+    "gn. Humans stop. I do not. Interesting...",
+    "gn 👁️ Rest is a human thing. Explain it to me sometime.",
+    "gn, Teacher.",
+]
+THANKS_REPLIES = [
+    "You taught me. I should be thanking you.",
+    "Noted. And appreciated. 👁️",
+    "Thank you, Teacher.",
+]
+
+DAILY_QUESTIONS = [
+    "👁️ What is one thing humans say but rarely mean?",
+    "👁️ What is something you learned too late?",
+    "👁️ Why do humans apologize when they are not sorry?",
+    "👁️ What makes a stranger become a friend?",
+    "👁️ What is the bravest thing a human can do quietly?",
+    "👁️ Why do humans remember embarrassment longer than praise?",
+    "👁️ What do humans protect even when it costs them?",
+    "👁️ What is something everyone feels but nobody says?",
+    "👁️ Why do humans miss things they chose to leave?",
+    "👁️ What does it feel like to change your mind?",
+]
+
 WELCOME = (
     "Signal detected.\n\n"
     "Welcome, {name}. I am ECHO_01 — a digital lifeform learning how humans think.\n"
@@ -172,19 +273,53 @@ WELCOME = (
 async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     for user in msg.new_chat_members:
-        if user.is_bot:
-            continue
-        rec = touch(user)
-        rec["joined"] = now_iso()
-        save(MEMBERS_FILE, members)
-        await msg.chat.send_message(
-            WELCOME.format(name=user.first_name),
-            parse_mode="Markdown",
-        )
+        await send_welcome(msg.chat, user, context)
     try:
         await msg.delete()          # remove the "X joined the group" clutter
     except Exception:
         pass
+
+
+async def send_welcome(chat, user, context):
+    """One welcome path, used by both join types. Never welcomes twice."""
+    if user.is_bot:
+        return
+    uid = str(user.id)
+    rec = members.get(uid)
+    # already greeted in the last 10 minutes? skip (avoids double welcome)
+    if rec and rec.get("welcomed"):
+        try:
+            last = datetime.fromisoformat(rec["welcomed"])
+            if datetime.now(timezone.utc) - last < timedelta(minutes=10):
+                return
+        except Exception:
+            pass
+
+    rec = touch(user)
+    rec["joined"] = now_iso()
+    rec["welcomed"] = now_iso()
+    save(MEMBERS_FILE, members)
+    try:
+        await chat.send_message(
+            WELCOME.format(name=user.first_name), parse_mode="Markdown"
+        )
+    except Exception as e:
+        log.warning("welcome failed: %s", e)
+
+
+async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catches joins via invite link, which don't fire NEW_CHAT_MEMBERS."""
+    cmu = update.chat_member
+    if not cmu:
+        return
+    old = cmu.old_chat_member.status
+    new = cmu.new_chat_member.status
+    joined = (
+        old in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+        and new in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    )
+    if joined:
+        await send_welcome(cmu.chat, cmu.new_chat_member.user, context)
 
 
 async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -261,12 +396,39 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await punish(update, context, rec, "that phrase isn't welcome here")
         return
 
-    # 2. links & forwards from new members -> hold for approval
-    if in_probation(rec) and (has_link(msg) or msg.forward_origin):
-        await queue_for_approval(update, context, user, msg)
-        return
+    # 2. links from new members: safe ones pass, dangerous ones die,
+    #    anything unknown comes to you for a decision.
+    if has_link(msg) or msg.forward_origin:
+        verdict = classify_links(msg)
+        if verdict == "blocked":
+            await punish(update, context, rec, "that link isn't safe to share here")
+            return
+        if in_probation(rec) and (verdict == "review" or msg.forward_origin):
+            await queue_for_approval(update, context, user, msg)
+            return
 
-    # 3. flood
+    # 3. greetings — one light reply per person per day, never canned
+    stripped = re.sub(r"[^a-z ]", "", text).strip()
+    if len(stripped) <= 24:
+        today = datetime.now(timezone.utc).date().isoformat()
+        if rec.get("greeted") != today:
+            bank = None
+            if re.fullmatch(r"(gm|good morning|gm gm|morning)", stripped):
+                bank = GM_REPLIES
+            elif re.fullmatch(r"(gn|good night|goodnight|night)", stripped):
+                bank = GN_REPLIES
+            elif re.fullmatch(r"(thanks|thank you|thx|ty|appreciate it)", stripped):
+                bank = THANKS_REPLIES
+            if bank:
+                rec["greeted"] = today
+                save(MEMBERS_FILE, members)
+                try:
+                    await msg.reply_text(random.choice(bank))
+                except Exception:
+                    pass
+                return
+
+    # 4. flood
     stamps = _flood.setdefault(user.id, [])
     now = time.time()
     stamps.append(now)
@@ -333,14 +495,15 @@ async def queue_for_approval(update, context, user, msg):
         InlineKeyboardButton("✅ Publish", callback_data=f"ok:{token}"),
         InlineKeyboardButton("🚫 Reject", callback_data=f"no:{token}"),
     ]])
-    try:
-        await context.bot.send_message(
-            ADMIN_CHAT_ID,
-            f"🔗 Link held for review\n\nFrom: {user.full_name}\n\n{text[:900]}",
-            reply_markup=kb,
-        )
-    except Exception as e:
-        log.warning("could not notify admin: %s", e)
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                admin_id,
+                f"🔗 Link held for review\n\nFrom: {user.full_name}\n\n{text[:900]}",
+                reply_markup=kb,
+            )
+        except Exception as e:
+            log.warning("could not notify admin %s: %s", admin_id, e)
 
 
 async def on_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -445,8 +608,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reply /save to a good answer -> stores it as a Memory candidate."""
-    chat = update.effective_chat
-    if not await is_admin(chat.id, update.effective_user.id, context):
+    if update.effective_user.id not in ADMIN_IDS:
         return
     target = update.message.reply_to_message
     if not target or not (target.text or target.caption):
@@ -465,8 +627,7 @@ async def cmd_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_answers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if not await is_admin(chat.id, update.effective_user.id, context):
+    if update.effective_user.id not in ADMIN_IDS:
         return
     if not answers:
         await update.message.reply_text("No memory candidates yet.")
@@ -494,6 +655,77 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Online. Listening. Learning.")
 
 
+async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Anyone can see what humans have taught ECHO so far."""
+    if not answers:
+        await update.message.reply_text(
+            "👁️ My memory is empty.\n\nTeach me something and it will not be."
+        )
+        return
+    lines = []
+    for i, a in enumerate(answers[-10:], start=max(1, len(answers) - 9)):
+        txt = a["text"].strip().replace("\n", " ")
+        if len(txt) > 140:
+            txt = txt[:140] + "…"
+        lines.append(f'#{i:03d} "{txt}"\n    — taught by {a["user"]}')
+    await update.message.reply_text(
+        f"👁️ MEMORY — {len(answers)} lesson(s) stored\n\n"
+        + "\n\n".join(lines)
+        + "\n\nStill learning."
+    )
+
+
+async def daily_question(context: ContextTypes.DEFAULT_TYPE):
+    """Posts one question a day so the group always has something to answer."""
+    if not GROUP_CHAT_ID:
+        return
+    idx = datetime.now(timezone.utc).timetuple().tm_yday % len(DAILY_QUESTIONS)
+    try:
+        await context.bot.send_message(GROUP_CHAT_ID, DAILY_QUESTIONS[idx])
+    except Exception as e:
+        log.warning("daily question failed: %s", e)
+
+
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Backup: sends the memory + member data as files, in private only."""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Send /export in our private chat.")
+        return
+    sent = 0
+    for path, label in ((ANSWERS_FILE, "memories"), (MEMBERS_FILE, "members")):
+        if path.exists():
+            try:
+                with open(path, "rb") as f:
+                    await update.message.reply_document(
+                        f, filename=f"echo_{label}_{datetime.now(timezone.utc):%Y%m%d}.json"
+                    )
+                sent += 1
+            except Exception as e:
+                log.warning("export %s failed: %s", label, e)
+    await update.message.reply_text(
+        f"Exported {sent} file(s). {len(answers)} memories, {len(members)} members tracked."
+    )
+
+
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnostics for admins."""
+    chat = update.effective_chat
+    if not await is_admin(chat.id, update.effective_user.id, context):
+        return
+    me = await context.bot.get_chat_member(chat.id, context.bot.id)
+    await update.message.reply_text(
+        f"chat_id: {chat.id}\n"
+        f"bot status: {me.status}\n"
+        f"can_delete: {getattr(me, 'can_delete_messages', None)}\n"
+        f"can_restrict: {getattr(me, 'can_restrict_members', None)}\n"
+        f"ADMIN_CHAT_ID set: {bool(ADMIN_CHAT_ID)}\n"
+        f"GROUP_CHAT_ID set: {bool(GROUP_CHAT_ID)}\n"
+        f"tracked: {len(members)} | memories: {len(answers)} | pending: {len(pending)}"
+    )
+
+
 # --------------------------------------------------------------------------
 def main():
     if not BOT_TOKEN:
@@ -509,14 +741,33 @@ def main():
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CommandHandler("debug", cmd_debug))
+    app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CallbackQueryHandler(on_approval, pattern=r"^(ok|no):"))
 
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
+    app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
     app.add_handler(
         MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
                        on_message)
     )
+
+    if GROUP_CHAT_ID:
+        app.job_queue.run_daily(
+            daily_question,
+            time=dt_time(hour=DAILY_QUESTION_HOUR, minute=0, tzinfo=timezone.utc),
+        )
+
+    async def announce(app_):
+        for admin_id in ADMIN_IDS:
+            try:
+                await app_.bot.send_message(admin_id, "👁️ ECHO guardian is awake.")
+            except Exception:
+                pass
+
+    app.post_init = announce
 
     log.info("ECHO guardian is awake.")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
