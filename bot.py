@@ -257,11 +257,11 @@ STICKER_INDEX = {}
 # Which sticker (by index from /stickers) to use for each reply.
 # Run /stickers in private to see the list, then set these numbers.
 STICKER_FOR = {
-    "gm": None,
-    "gn": None,
-    "hello": None,
-    "thanks": None,
-    "welcome": None,
+    "gm":      8,    # GM
+    "gn":      7,    # BYE
+    "hello":   14,   # HELLO
+    "thanks":  5,    # LOVE
+    "welcome": 12,   # WOW
 }
 
 
