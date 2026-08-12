@@ -78,9 +78,15 @@ WARN_AUTODELETE_SECONDS = 25
 
 # Words that get a message deleted instantly (edit freely, lowercase)
 BLACKLIST = [
-    "airdrop claim", "free mint", "dm me", "send me your seed",
-    "seed phrase", "private key", "guaranteed profit", "1000x",
-    "pump signal", "casino", "porn", "invest with me",
+    "airdrop claim", "claim airdrop", "free mint", "dm me",
+    "send me your seed", "seed phrase", "private key",
+    "guaranteed profit", "1000x", "pump signal", "casino",
+    "porn", "invest with me",
+    # gift / bonus bait
+    "welcome bonus", "claim $100", "claim 100", "bonus 🎁",
+    "free bonus", "sign up bonus", "deposit bonus",
+    "connect wallet", "verify wallet", "sync wallet",
+    "binance airdrop", "telegram x binance", "telegram × binance",
 ]
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -195,9 +201,23 @@ def domain_of(url: str) -> str:
     return d
 
 
+def button_urls(message) -> list:
+    """URLs hidden inside inline keyboard buttons."""
+    out = []
+    kb = getattr(message, "reply_markup", None)
+    if kb and getattr(kb, "inline_keyboard", None):
+        for row in kb.inline_keyboard:
+            for btn in row:
+                if getattr(btn, "url", None):
+                    out.append(btn.url)
+                elif getattr(btn, "login_url", None):
+                    out.append(getattr(btn.login_url, "url", "") or "")
+    return [u for u in out if u]
+
+
 def classify_links(message) -> str:
     """Returns 'safe', 'blocked', or 'review'."""
-    urls = extract_urls(message)
+    urls = extract_urls(message) + button_urls(message)
     if not urls:
         return "safe"
 
@@ -220,6 +240,8 @@ def has_link(message) -> bool:
     for e in entities:
         if e.type in ("url", "text_link", "mention"):
             return True
+    if button_urls(message):
+        return True
     text = ((message.text or "") + " " + (message.caption or "")).lower()
     return any(x in text for x in ("http://", "https://", "t.me/", "www.", ".com", ".xyz"))
 
@@ -434,12 +456,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 2. links from new members: safe ones pass, dangerous ones die,
     #    anything unknown comes to you for a decision.
-    if has_link(msg) or msg.forward_origin:
+    if has_link(msg) or msg.forward_origin or button_urls(msg):
         verdict = classify_links(msg)
+        # a wall of link-buttons is the classic scam shape — never auto-publish it
+        if len(button_urls(msg)) >= 3:
+            verdict = "blocked"
         if verdict == "blocked":
             await punish(update, context, rec, "that link isn't safe to share here")
             return
-        if in_probation(rec) and (verdict == "review" or msg.forward_origin):
+        if in_probation(rec) and (verdict == "review" or msg.forward_origin or button_urls(msg)):
             await queue_for_approval(update, context, user, msg)
             return
 
