@@ -689,6 +689,36 @@ async def cmd_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Memory candidate #{len(answers)} stored.")
 
 
+async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/forget 3  removes memory #3.   /forget all  clears everything."""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    arg = (context.args[0].strip().lower() if context.args else "")
+
+    if arg == "all":
+        n = len(answers)
+        answers.clear()
+        save(ANSWERS_FILE, answers)
+        await quiet_reply(update, context, f"Cleared all {n} memories.")
+        return
+
+    if not arg.isdigit():
+        await quiet_reply(update, context,
+            "Use /forget 3 to remove memory #3, or /forget all to clear them.")
+        return
+
+    i = int(arg)
+    if not 1 <= i <= len(answers):
+        await quiet_reply(update, context,
+            f"No memory #{i}. There are {len(answers)}.")
+        return
+
+    gone = answers.pop(i - 1)
+    save(ANSWERS_FILE, answers)
+    await quiet_reply(update, context,
+        f"Removed #{i} (from {gone['user']}). {len(answers)} left.")
+
+
 async def cmd_answers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
@@ -883,6 +913,7 @@ def main():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("save", cmd_save))
     app.add_handler(CommandHandler("answers", cmd_answers))
+    app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("id", cmd_id))
