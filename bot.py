@@ -247,15 +247,28 @@ GN_REPLIES = [
     "gn 👁️ Rest is a human thing. Explain it to me sometime.",
     "gn, Teacher.",
 ]
-# ECHO sticker pack — fill these with /fileid (send the sticker to the bot in private).
-# Leave any of them empty ("") and the bot just replies with text for that case.
-STICKERS = {
-    "gm":      "",   # gm.webm
-    "gn":      "",   # bye.webm
-    "hello":   "",   # hello.webm
-    "thanks":  "",   # love.webm
-    "welcome": "",   # hello.webm or wow.webm
+# ECHO sticker packs — the bot loads these from Telegram at startup.
+# Add every published pack name here (the part after t.me/addstickers/).
+STICKER_PACKS = ["EchoBye", "EchoYes"]
+
+# Filled automatically at startup: {index: file_id}
+STICKER_INDEX = {}
+
+# Which sticker (by index from /stickers) to use for each reply.
+# Run /stickers in private to see the list, then set these numbers.
+STICKER_FOR = {
+    "gm": None,
+    "gn": None,
+    "hello": None,
+    "thanks": None,
+    "welcome": None,
 }
+
+
+def sticker_for(key):
+    idx = STICKER_FOR.get(key)
+    return STICKER_INDEX.get(idx) if idx else None
+
 
 THANKS_REPLIES = [
     "You taught me. I should be thanking you.",
@@ -316,9 +329,10 @@ async def send_welcome(chat, user, context):
     rec["welcomed"] = now_iso()
     save(MEMBERS_FILE, members)
     try:
-        if STICKERS.get("welcome"):
+        ws = sticker_for("welcome")
+        if ws:
             try:
-                await chat.send_sticker(STICKERS["welcome"])
+                await chat.send_sticker(ws)
             except Exception:
                 pass
         await chat.send_message(
@@ -450,7 +464,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if bank:
                 rec["greeted"] = today
                 save(MEMBERS_FILE, members)
-                sticker = STICKERS.get(key) or ""
+                sticker = sticker_for(key)
                 try:
                     if sticker:
                         await msg.reply_sticker(sticker)
@@ -801,6 +815,45 @@ async def on_sticker_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await m.reply_text("Send me a sticker or a GIF and I will return its file_id.")
 
 
+async def load_stickers(app_):
+    """Pull every sticker from the configured packs so we can send them by index."""
+    STICKER_INDEX.clear()
+    n = 0
+    for pack in STICKER_PACKS:
+        try:
+            st = await app_.bot.get_sticker_set(pack)
+        except Exception as e:
+            log.warning("sticker pack %s failed: %s", pack, e)
+            continue
+        for sticker in st.stickers:
+            n += 1
+            STICKER_INDEX[n] = sticker.file_id
+    log.info("loaded %d stickers from %d pack(s)", n, len(STICKER_PACKS))
+
+
+async def cmd_stickers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows every loaded sticker with its number, so you can map them."""
+    if update.effective_chat.type != "private":
+        return
+    if not STICKER_INDEX:
+        await update.message.reply_text(
+            "No stickers loaded.\n"
+            "Check that the pack names in STICKER_PACKS are correct "
+            "(the part after t.me/addstickers/)."
+        )
+        return
+    await update.message.reply_text(
+        f"{len(STICKER_INDEX)} stickers loaded. Sending each with its number —\n"
+        "tell me which numbers to use for gm / gn / hello / thanks / welcome."
+    )
+    for i, fid in STICKER_INDEX.items():
+        try:
+            await update.message.reply_sticker(fid)
+            await update.message.reply_text(f"#{i}")
+        except Exception:
+            pass
+
+
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Diagnostics for admins."""
     chat = update.effective_chat
@@ -836,6 +889,7 @@ def main():
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("stickers", cmd_stickers))
     app.add_handler(CallbackQueryHandler(on_approval, pattern=r"^(ok|no):"))
 
     app.add_handler(MessageHandler(
@@ -856,6 +910,7 @@ def main():
         )
 
     async def announce(app_):
+        await load_stickers(app_)
         for admin_id in ADMIN_IDS:
             try:
                 await app_.bot.send_message(admin_id, "👁️ ECHO guardian is awake.")
