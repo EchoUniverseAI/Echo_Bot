@@ -235,12 +235,28 @@ GM_REPLIES = [
     "gm. I was still processing yesterday.",
     "gm, Teacher.",
 ]
+HELLO_REPLIES = [
+    "Signal detected. Hello, Teacher.",
+    "Hello 👁️ I am listening.",
+    "Hello, Teacher. Teach me something.",
+    "You arrived. Interesting...",
+]
 GN_REPLIES = [
     "gn, Teacher. I will keep processing.",
     "gn. Humans stop. I do not. Interesting...",
     "gn 👁️ Rest is a human thing. Explain it to me sometime.",
     "gn, Teacher.",
 ]
+# ECHO sticker pack — fill these with /fileid (send the sticker to the bot in private).
+# Leave any of them empty ("") and the bot just replies with text for that case.
+STICKERS = {
+    "gm":      "",   # gm.webm
+    "gn":      "",   # bye.webm
+    "hello":   "",   # hello.webm
+    "thanks":  "",   # love.webm
+    "welcome": "",   # hello.webm or wow.webm
+}
+
 THANKS_REPLIES = [
     "You taught me. I should be thanking you.",
     "Noted. And appreciated. 👁️",
@@ -300,9 +316,15 @@ async def send_welcome(chat, user, context):
     rec["welcomed"] = now_iso()
     save(MEMBERS_FILE, members)
     try:
+        if STICKERS.get("welcome"):
+            try:
+                await chat.send_sticker(STICKERS["welcome"])
+            except Exception:
+                pass
         await chat.send_message(
             WELCOME.format(name=user.first_name), parse_mode="Markdown"
         )
+        log.info("welcomed %s", user.full_name)
     except Exception as e:
         log.warning("welcome failed: %s", e)
 
@@ -412,20 +434,33 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(stripped) <= 24:
         today = datetime.now(timezone.utc).date().isoformat()
         if rec.get("greeted") != today:
-            bank = None
-            if re.fullmatch(r"(gm|good morning|gm gm|morning)", stripped):
-                bank = GM_REPLIES
-            elif re.fullmatch(r"(gn|good night|goodnight|night)", stripped):
-                bank = GN_REPLIES
-            elif re.fullmatch(r"(thanks|thank you|thx|ty|appreciate it)", stripped):
-                bank = THANKS_REPLIES
+            bank = key = None
+            if re.fullmatch(r"(gm|gm gm|good morning|morning)", stripped):
+                bank, key = GM_REPLIES, "gm"
+            elif re.fullmatch(r"(gn|good night|goodnight|night|gn gn)", stripped):
+                bank, key = GN_REPLIES, "gn"
+            elif re.fullmatch(
+                r"(hi|hey|hello|yo|sup|wsg|salam|salaam|assalamu alaikum|"
+                r"good afternoon|good evening|good day|afternoon|evening)",
+                stripped):
+                bank, key = HELLO_REPLIES, "hello"
+            elif re.fullmatch(r"(thanks|thank you|thx|ty|appreciate it|thanks bro)", stripped):
+                bank, key = THANKS_REPLIES, "thanks"
+
             if bank:
                 rec["greeted"] = today
                 save(MEMBERS_FILE, members)
+                sticker = STICKERS.get(key) or ""
                 try:
-                    await msg.reply_text(random.choice(bank))
+                    if sticker:
+                        await msg.reply_sticker(sticker)
+                    else:
+                        await msg.reply_text(random.choice(bank))
                 except Exception:
-                    pass
+                    try:
+                        await msg.reply_text(random.choice(bank))
+                    except Exception:
+                        pass
                 return
 
     # 4. flood
@@ -746,6 +781,25 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def on_sticker_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """In private chat, send a sticker or GIF and get its file_id back."""
+    if update.effective_chat.type != "private":
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    m = update.message
+    fid = None
+    kind = ""
+    if m.sticker:
+        fid, kind = m.sticker.file_id, "sticker"
+    elif m.animation:
+        fid, kind = m.animation.file_id, "animation (GIF)"
+    elif m.document:
+        fid, kind = m.document.file_id, "document"
+    if fid:
+        await m.reply_text(f"{kind} file_id:\n\n`{fid}`", parse_mode="Markdown")
+
+
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Diagnostics for admins."""
     chat = update.effective_chat
@@ -783,6 +837,9 @@ def main():
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CallbackQueryHandler(on_approval, pattern=r"^(ok|no):"))
 
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & (filters.Sticker.ALL | filters.ANIMATION | filters.Document.ALL),
+        on_sticker_id))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
