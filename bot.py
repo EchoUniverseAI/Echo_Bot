@@ -597,7 +597,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"{i+1}. {r['name']} — {r.get('msgs',0)}" for i, r in enumerate(top)
              if r.get("msgs", 0) > 0]
 
-    await update.message.reply_text(
+    await quiet_reply(update, context,
         f"Members in group: {total}\n"
         f"Ever said anything: {spoke_ever}\n"
         f"Spoke in last 7 days: {spoke_7d}\n"
@@ -612,7 +612,7 @@ async def cmd_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     target = update.message.reply_to_message
     if not target or not (target.text or target.caption):
-        await update.message.reply_text("Reply /save to the message you want to keep.")
+        await quiet_reply(update, context, "Reply /save to the message you want to keep.")
         return
     answers.append({
         "user": target.from_user.full_name,
@@ -621,23 +621,60 @@ async def cmd_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "saved_at": now_iso(),
     })
     save(ANSWERS_FILE, answers)
-    await update.message.reply_text(
-        f"Memory candidate #{len(answers)} stored. Thank you, {target.from_user.first_name}."
-    )
+
+    # wipe the command from the group, confirm to the admin privately
+    if update.effective_chat.type != "private":
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        try:
+            await context.bot.send_message(
+                update.effective_user.id,
+                f"Memory #{len(answers)} stored — from {target.from_user.full_name}:\n\n"
+                f"{(target.text or target.caption)[:300]}",
+            )
+        except Exception:
+            pass
+    else:
+        await update.message.reply_text(f"Memory candidate #{len(answers)} stored.")
 
 
 async def cmd_answers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     if not answers:
-        await update.message.reply_text("No memory candidates yet.")
+        await quiet_reply(update, context, "No memory candidates yet.")
         return
     last = answers[-15:]
     body = "\n\n".join(
         f"#{len(answers)-len(last)+i+1} — {a['user']}:\n{a['text'][:200]}"
         for i, a in enumerate(last)
     )
-    await update.message.reply_text(body[:4000])
+    await quiet_reply(update, context, body[:4000])
+
+
+async def quiet_reply(update, context, text):
+    """Admin output goes to DM; the command itself is wiped from the group.
+
+    Keeps the group clean — members never see admin traffic.
+    """
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if chat.type == "private":
+        await update.message.reply_text(text)
+        return
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    try:
+        await context.bot.send_message(user.id, text)
+    except Exception:
+        # user never opened a DM with the bot — fall back to a vanishing note
+        await temp_reply(update, context, "Open a private chat with me first.", 15)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -715,7 +752,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(chat.id, update.effective_user.id, context):
         return
     me = await context.bot.get_chat_member(chat.id, context.bot.id)
-    await update.message.reply_text(
+    await quiet_reply(update, context,
         f"chat_id: {chat.id}\n"
         f"bot status: {me.status}\n"
         f"can_delete: {getattr(me, 'can_delete_messages', None)}\n"
