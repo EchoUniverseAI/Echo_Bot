@@ -25,6 +25,8 @@ from pathlib import Path
 
 from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus
+import activity_tracker
+
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -974,6 +976,8 @@ def main():
                 pass
 
     app.post_init = announce
+
+    activity_tracker.register(app)
 
     log.info("ECHO guardian is awake.")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
