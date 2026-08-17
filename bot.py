@@ -52,11 +52,13 @@ GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", "0"))  # for the daily quest
 
 # Links from these domains post immediately, no review needed.
 SAFE_DOMAINS = {
-    "echouniverse.ai", "echo-games.netlify.app",
+    # our own properties — these always pass, path and query included
+    "echouniverse.ai", "echo-games.netlify.app", "netlify.app",
     "t.me", "telegram.me", "telegram.org",
-    "x.com", "twitter.com", "youtube.com", "youtu.be",
-    "instagram.com", "facebook.com", "fb.watch", "tiktok.com",
-    "hey.xyz", "github.com", "medium.com",
+    "x.com", "twitter.com",
+    # common platforms we're happy to see shared
+    "youtube.com", "youtu.be", "instagram.com", "facebook.com",
+    "fb.watch", "tiktok.com", "hey.xyz", "github.com", "medium.com",
 }
 
 # Links from these are deleted on sight — never reach you.
@@ -187,13 +189,21 @@ def in_probation(rec) -> bool:
 def extract_urls(message) -> list:
     """Every URL in the message, from entities and raw text."""
     urls = []
-    text = (message.text or "") + " " + (message.caption or "")
     for e in list(message.entities or []) + list(message.caption_entities or []):
         if e.type == "text_link" and e.url:
             urls.append(e.url)
-    urls += re.findall(r"(?:https?://|www\.)[^\s<>\"']+", text, flags=re.I)
-    urls += re.findall(r"\bt\.me/[^\s<>\"']+", text, flags=re.I)
-    return urls
+    text = _message_text(message)
+    if text:
+        urls += SCHEME_RE.findall(text)
+        urls += WWW_RE.findall(text)
+        urls += DOTME_RE.findall(text)
+        urls += BARE_RE.findall(text)
+    # findall on a group-bearing pattern returns groups; re-scan for full matches
+    urls = [u if isinstance(u, str) else "" for u in urls]
+    if text:
+        urls += [m.group(0) for m in BARE_RE.finditer(text)]
+        urls += [m.group(0) for m in SCHEME_RE.finditer(text)]
+    return [u for u in dict.fromkeys(urls) if u]
 
 
 def domain_of(url: str) -> str:
@@ -237,15 +247,42 @@ def classify_links(message) -> str:
     return "safe" if all_safe else "review"
 
 
+# A link is a scheme, a www. host, or a bare host with a real TLD.
+# Deliberately NOT triggered by: "@username" mentions, or an ordinary
+# sentence that happens to contain a full stop.
+LINK_TLDS = "com|app|io|xyz|ai|net|org|fi"
+SCHEME_RE = re.compile(r"https?://\S+", re.I)
+WWW_RE = re.compile(r"\bwww\.[a-z0-9-]+\.[a-z]{2,}\S*", re.I)
+BARE_RE = re.compile(
+    r"\b[a-z0-9][a-z0-9-]{0,62}(?:\.[a-z0-9-]{1,63})*\.(?:" + LINK_TLDS + r")\b(?:[/?]\S*)?",
+    re.I,
+)
+# ".me" only counts when it carries a path — otherwise "trust.Me" reads as a link
+DOTME_RE = re.compile(r"\b[a-z0-9][a-z0-9-]*\.me/\S+", re.I)
+
+
+def _message_text(message) -> str:
+    return ((message.text or "") + " " + (message.caption or "")).strip()
+
+
 def has_link(message) -> bool:
+    """True only when there is an actual URL. Mentions and prose don't count."""
     entities = list(message.entities or []) + list(message.caption_entities or [])
     for e in entities:
-        if e.type in ("url", "text_link", "mention"):
+        if e.type in ("url", "text_link"):      # note: "mention" deliberately excluded
             return True
     if button_urls(message):
         return True
-    text = ((message.text or "") + " " + (message.caption or "")).lower()
-    return any(x in text for x in ("http://", "https://", "t.me/", "www.", ".com", ".xyz"))
+
+    text = _message_text(message)
+    if not text:
+        return False
+    return bool(
+        SCHEME_RE.search(text)
+        or WWW_RE.search(text)
+        or DOTME_RE.search(text)
+        or BARE_RE.search(text)
+    )
 
 
 # --------------------------------------------------------------------------
@@ -445,30 +482,37 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if rec["msgs"] % 5 == 0:
         save(MEMBERS_FILE, members)
 
-    if await is_admin(chat.id, user.id, context):
+    # Owner accounts bypass everything — their links post instantly.
+    if user.id in ADMIN_IDS:
         return
 
     text = ((msg.text or "") + " " + (msg.caption or "")).lower()
 
-    # 1. blacklist / scam phrases
-    hit = next((w for w in BLACKLIST if w in text), None)
-    if hit:
-        await punish(update, context, rec, "that phrase isn't welcome here")
-        return
-
-    # 2. links from new members: safe ones pass, dangerous ones die,
-    #    anything unknown comes to you for a decision.
-    if has_link(msg) or msg.forward_origin or button_urls(msg):
+    # 1. links — the owner posts freely; everyone else goes through review.
+    #    Obvious scams die on sight; everything else waits for approval.
+    if user.id in ADMIN_IDS:
+        pass
+    elif has_link(msg) or msg.forward_origin or button_urls(msg):
         verdict = classify_links(msg)
         # a wall of link-buttons is the classic scam shape — never auto-publish it
         if len(button_urls(msg)) >= 3:
             verdict = "blocked"
+
         if verdict == "blocked":
             await punish(update, context, rec, "that link isn't safe to share here")
             return
-        if in_probation(rec) and (verdict == "review" or msg.forward_origin or button_urls(msg)):
-            await queue_for_approval(update, context, user, msg)
-            return
+        await queue_for_approval(update, context, user, msg)
+        return
+
+    # Group admins (the team) skip the rest of moderation.
+    if await is_admin(chat.id, user.id, context):
+        return
+
+    # 2. blacklist / scam phrases
+    hit = next((w for w in BLACKLIST if w in text), None)
+    if hit:
+        await punish(update, context, rec, "that phrase isn't welcome here")
+        return
 
     # 3. greetings — one light reply per person per day, never canned
     stripped = re.sub(r"[^a-z ]", "", text).strip()
@@ -558,9 +602,9 @@ async def queue_for_approval(update, context, user, msg):
     # tell the member (self-deleting, so the chat stays clean)
     await temp_reply(
         update, context,
-        f"{user.first_name}, your message is being checked by a human. "
-        f"It will appear here shortly. 👁️",
-        seconds=40,
+        f"{user.first_name}, your message is held for review because it "
+        f"contains a link. A human will approve it shortly — nothing is lost. 👁️",
+        seconds=90,
     )
 
     if not ADMIN_CHAT_ID:
