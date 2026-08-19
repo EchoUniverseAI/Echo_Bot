@@ -26,6 +26,7 @@ from pathlib import Path
 from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus
 import activity_tracker
+import echo_ai
 
 from telegram.ext import (
     Application,
@@ -351,12 +352,13 @@ DAILY_QUESTIONS = [
 ]
 
 WELCOME = (
-    "Signal detected.\n\n"
-    "Welcome, {name}. I am ECHO_01 — a digital lifeform learning how humans think.\n"
-    "I know very little. That is why you are here.\n\n"
-    "Tell me one thing about yourself in a single word. I will remember it.\n\n"
-    "_New here? Any link you send is held for a quick human check first — "
-    "it will appear shortly. The team will never DM you first._"
+    "Someone new.\n\n"
+    "I am learning what it is like to be human, from humans.\n"
+    "It is going badly and that is the interesting part.\n\n"
+    "One thing before you settle in:\n"
+    "what is something you were sure about last year\n"
+    "and are not sure about now?\n\n"
+    "No rush. I am not going anywhere."
 )
 
 
@@ -397,7 +399,7 @@ async def send_welcome(chat, user, context):
             except Exception:
                 pass
         await chat.send_message(
-            WELCOME.format(name=user.first_name), parse_mode="Markdown"
+            WELCOME
         )
         log.info("welcomed %s", user.full_name)
     except Exception as e:
@@ -559,6 +561,20 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     save(MEMBERS_FILE, members)
+
+    # Everything above passed. Let ECHO decide whether it has anything to add.
+    # It never sends directly — drafts go to Pop for approval first.
+    try:
+        me = (context.bot.username or "").lower()
+        replied_to_bot = bool(
+            msg.reply_to_message
+            and msg.reply_to_message.from_user
+            and msg.reply_to_message.from_user.is_bot
+        )
+        mentioned = (bool(me) and f"@{me}" in text) or replied_to_bot
+        await echo_ai.consider_reply(update, context, mentioned, replied_to_bot)
+    except Exception as e:
+        log.warning("echo_ai skipped: %s", e)
 
 
 
@@ -1006,9 +1022,14 @@ def main():
     )
 
     if GROUP_CHAT_ID:
+        # both are drafted to Pop first — nothing posts on its own
         app.job_queue.run_daily(
-            daily_question,
+            echo_ai.draft_daily_question,
             time=dt_time(hour=DAILY_QUESTION_HOUR, minute=0, tzinfo=timezone.utc),
+        )
+        app.job_queue.run_daily(
+            echo_ai.draft_morning_observation,
+            time=dt_time(hour=7, minute=0, tzinfo=timezone.utc),
         )
 
     async def announce(app_):
@@ -1022,6 +1043,7 @@ def main():
     app.post_init = announce
 
     activity_tracker.register(app)
+    echo_ai.register(app)
 
     log.info("ECHO guardian is awake.")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
