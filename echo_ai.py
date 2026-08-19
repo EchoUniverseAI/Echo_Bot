@@ -468,6 +468,13 @@ async def consider_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not text:
         return
 
+    # --- a question about a mirror gets the fixed line, never a generated one
+    try:
+        if await maybe_answer_meaning(update):
+            return
+    except Exception:
+        pass
+
     # --- escalation first, always
     esc = check_escalation(text)
     if esc == "distress":
@@ -596,6 +603,116 @@ async def draft_morning_observation(context: ContextTypes.DEFAULT_TYPE):
     await queue_draft(context, "observation", f"👁️ {out.strip()}", GROUP_CHAT_ID)
 
 
+
+# --------------------------------------------------------------------------
+# THE MIRROR — /mirror
+#
+# Returns one thing the person actually wrote. Never interpreted, never
+# paraphrased, never generated. The person chooses the moment; nothing is
+# ever pushed at them unprompted.
+#
+# There is no time-based recall. A sentence that was fine to write can be
+# devastating to receive on the wrong day, and nothing in this file can know
+# what kind of day someone is having.
+# --------------------------------------------------------------------------
+MIRROR_OPTOUT_FILE = DATA_DIR / "mirror_optout.json"
+
+MIRROR_CLOSING = "That is all. I am not going to tell you what it means."
+
+MIRROR_MEANING_REPLY = (
+    "I do not know. That one is yours.\n\n"
+    "I keep what people say. Deciding what it meant\n"
+    "is the part I am not built for."
+)
+
+MIRROR_EMPTY = (
+    "You have not taught me anything yet.\n\n"
+    "When you do, I will keep it exactly as you said it."
+)
+
+MIRROR_OFF = "Done. I will not show you your own words again."
+
+# asked right after a mirror — answered with the fixed line, never generated
+MEANING_QUESTIONS = re.compile(
+    r"^\s*(what does (that|this|it) mean|what do you mean|meaning\?*|"
+    r"why (that|this) one|what does it say about me)\s*[?.!]*\s*$",
+    re.I,
+)
+
+
+def _optouts() -> set:
+    return set(_load(MIRROR_OPTOUT_FILE, []))
+
+
+def _set_optout(user_id: int, on: bool):
+    ids = _optouts()
+    ids.add(user_id) if on else ids.discard(user_id)
+    _save(MIRROR_OPTOUT_FILE, sorted(ids))
+
+
+def _own_memories(user_id: int) -> list:
+    """Only what this person wrote. Never someone else's words."""
+    return [
+        a for a in _load(ANSWERS_FILE, [])
+        if str(a.get("user_id", "")) == str(user_id) and a.get("text", "").strip()
+    ]
+
+
+async def cmd_mirror(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+
+    if user.id in _optouts():
+        return                                  # silent — they already said no
+
+    mine = _own_memories(user.id)
+    if not mine:
+        await update.effective_message.reply_text(MIRROR_EMPTY)
+        return
+
+    entry = random.choice(mine)
+    when = ""
+    try:
+        d = datetime.fromisoformat(entry["saved_at"])
+        when = d.strftime("%d %B")
+    except Exception:
+        pass
+
+    body = f'"{entry["text"].strip()}"'
+    if when:
+        body += f"\n\n— you, {when}"
+
+    await update.effective_message.reply_text(
+        f"{body}\n\n{MIRROR_CLOSING}"
+    )
+
+
+async def cmd_mirror_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """One command, no confirmation. Asking 'are you sure?' is pressure."""
+    user = update.effective_user
+    if not user:
+        return
+    _set_optout(user.id, True)
+    await update.effective_message.reply_text(MIRROR_OFF)
+
+
+async def maybe_answer_meaning(update: Update) -> bool:
+    """If someone asks what a mirror meant, answer with the fixed line.
+    Returns True if handled — the generator must never touch this."""
+    msg = update.effective_message
+    text = (msg.text or "").strip()
+    if not MEANING_QUESTIONS.match(text):
+        return False
+    reply = msg.reply_to_message
+    if not (reply and reply.from_user and reply.from_user.is_bot):
+        return False
+    if MIRROR_CLOSING not in (reply.text or ""):
+        return False
+    await msg.reply_text(MIRROR_MEANING_REPLY)
+    return True
+
+
 # --------------------------------------------------------------------------
 # COMMANDS
 # --------------------------------------------------------------------------
@@ -631,6 +748,8 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def register(application: Application, group: int = 8):
     application.add_handler(CommandHandler("drafts", cmd_drafts))
     application.add_handler(CommandHandler("ask", cmd_ask))
+    application.add_handler(CommandHandler("mirror", cmd_mirror))
+    application.add_handler(CommandHandler("mirror_off", cmd_mirror_off))
     application.add_handler(
         CallbackQueryHandler(on_draft_decision, pattern=r"^draft_(ok|no):")
     )
