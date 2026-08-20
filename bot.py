@@ -41,6 +41,8 @@ from telegram.ext import (
 # --------------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------------
+BUILD = "2026-08-20c"      # bump this on every deploy — /debug shows it
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 
@@ -251,7 +253,18 @@ def classify_links(message) -> str:
 # A link is a scheme, a www. host, or a bare host with a real TLD.
 # Deliberately NOT triggered by: "@username" mentions, or an ordinary
 # sentence that happens to contain a full stop.
-LINK_TLDS = "com|app|io|xyz|ai|net|org|fi"
+# Every TLD a real link in this group might use. The short list before this
+# missed bit.ly entirely — the shortener blocklist was unreachable, because
+# has_link() never saw ".ly" as a link in the first place.
+# Deliberately excluded: two-letter TLDs that collide with English words after
+# a missing space ("wait.It", "fine.So") — .it .is .at .in .to .so .be .us .no
+LINK_TLDS = (
+    "com|net|org|info|biz|app|dev|io|ai|xyz|co|cc|ly|gl|gg|gy|sh|im|pw|su|tk|"
+    "ml|ga|cf|gq|ru|cn|tv|fi|link|live|life|world|today|zone|site|online|"
+    "shop|store|club|fun|top|vip|pro|space|website|digital|global|host|cloud|"
+    "page|tech|network|finance|capital|cash|money|win|bet|casino|art|blog|"
+    "news|media|agency|group|team|run|one|wtf|lol|uk|de|fr|es"
+)
 SCHEME_RE = re.compile(r"https?://\S+", re.I)
 WWW_RE = re.compile(r"\bwww\.[a-z0-9-]+\.[a-z]{2,}\S*", re.I)
 BARE_RE = re.compile(
@@ -338,6 +351,20 @@ THANKS_REPLIES = [
     "Thank you, Teacher.",
 ]
 
+# How many greetings ECHO answers per person per day.
+GREET_MAX_PER_DAY = 2
+
+# A greeting is a greeting even with words after it: "gm all", "gm fam",
+# "good morning everyone". Matching only the bare word missed most of them.
+GREET_PATTERNS = [
+    (re.compile(r"^(gm+|gm gm|good morning|morning)\b.{0,25}$"), "gm"),
+    (re.compile(r"^(gn+|good night|goodnight|night|gn gn)\b.{0,25}$"), "gn"),
+    (re.compile(r"^(hi+|hey+|hello+|yo+|sup|wsg|wassup|whats up|salam|salaam|"
+                r"assalamu alaikum|asalamualaikum|good afternoon|good evening|"
+                r"good day|afternoon|evening)\b.{0,25}$"), "hello"),
+    (re.compile(r"^(thanks|thank you|thankyou|thx|ty|appreciate it)\b.{0,25}$"), "thanks"),
+]
+
 DAILY_QUESTIONS = [
     "👁️ What is one thing humans say but rarely mean?",
     "👁️ What is something you learned too late?",
@@ -350,6 +377,28 @@ DAILY_QUESTIONS = [
     "👁️ Why do humans miss things they chose to leave?",
     "👁️ What does it feel like to change your mind?",
 ]
+
+GREET_BANK = {
+    "gm": GM_REPLIES,
+    "gn": GN_REPLIES,
+    "hello": HELLO_REPLIES,
+    "thanks": THANKS_REPLIES,
+}
+
+
+def greet_count_today(rec) -> int:
+    """Backward compatible with the old rec['greeted'] = 'YYYY-MM-DD' format."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    g = rec.get("greeted")
+    if isinstance(g, dict):
+        return g.get("n", 0) if g.get("day") == today else 0
+    return 1 if g == today else 0
+
+
+def bump_greet(rec) -> None:
+    today = datetime.now(timezone.utc).date().isoformat()
+    rec["greeted"] = {"day": today, "n": greet_count_today(rec) + 1}
+
 
 WELCOME = (
     "Someone new.\n\n"
@@ -484,17 +533,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if rec["msgs"] % 5 == 0:
         save(MEMBERS_FILE, members)
 
-    # Owner accounts bypass everything — their links post instantly.
-    if user.id in ADMIN_IDS:
-        return
-
     text = ((msg.text or "") + " " + (msg.caption or "")).lower()
 
-    # 1. links — the owner posts freely; everyone else goes through review.
-    #    Obvious scams die on sight; everything else waits for approval.
-    if user.id in ADMIN_IDS:
-        pass
-    elif has_link(msg) or msg.forward_origin or button_urls(msg):
+    is_owner = user.id in ADMIN_IDS
+    is_mod = is_owner or await is_admin(chat.id, user.id, context)
+
+    # 1. links — owners post freely. Known scams die on sight. Links to places
+    #    we trust pass, unless the member is brand new. Everything else waits.
+    if not is_owner and (has_link(msg) or msg.forward_origin or button_urls(msg)):
         verdict = classify_links(msg)
         # a wall of link-buttons is the classic scam shape — never auto-publish it
         if len(button_urls(msg)) >= 3:
@@ -503,62 +549,50 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if verdict == "blocked":
             await punish(update, context, rec, "that link isn't safe to share here")
             return
-        await queue_for_approval(update, context, user, msg)
-        return
+        # a safe domain from an established member stays where it is
+        if verdict == "review" or in_probation(rec) or msg.forward_origin:
+            await queue_for_approval(update, context, user, msg)
+            return
 
-    # Group admins (the team) skip the rest of moderation.
-    if await is_admin(chat.id, user.id, context):
-        return
+    # 2. blacklist / scam phrases — the team is exempt
+    if not is_mod:
+        hit = next((w for w in BLACKLIST if w in text), None)
+        if hit:
+            await punish(update, context, rec, "that phrase isn't welcome here")
+            return
 
-    # 2. blacklist / scam phrases
-    hit = next((w for w in BLACKLIST if w in text), None)
-    if hit:
-        await punish(update, context, rec, "that phrase isn't welcome here")
-        return
-
-    # 3. greetings — one light reply per person per day, never canned
-    stripped = re.sub(r"[^a-z ]", "", text).strip()
-    if len(stripped) <= 24:
-        today = datetime.now(timezone.utc).date().isoformat()
-        if rec.get("greeted") != today:
-            bank = key = None
-            if re.fullmatch(r"(gm|gm gm|good morning|morning)", stripped):
-                bank, key = GM_REPLIES, "gm"
-            elif re.fullmatch(r"(gn|good night|goodnight|night|gn gn)", stripped):
-                bank, key = GN_REPLIES, "gn"
-            elif re.fullmatch(
-                r"(hi|hey|hello|yo|sup|wsg|salam|salaam|assalamu alaikum|"
-                r"good afternoon|good evening|good day|afternoon|evening)",
-                stripped):
-                bank, key = HELLO_REPLIES, "hello"
-            elif re.fullmatch(r"(thanks|thank you|thx|ty|appreciate it|thanks bro)", stripped):
-                bank, key = THANKS_REPLIES, "thanks"
-
-            if bank:
-                rec["greeted"] = today
-                save(MEMBERS_FILE, members)
-                sticker = sticker_for(key)
+    # 3. greetings — a light reply, twice per person per day at most.
+    #    Admins say gm too. They used to get silence, which read as a broken bot.
+    stripped = re.sub(r"[^a-z ]", " ", text)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    if len(stripped) <= 30 and greet_count_today(rec) < GREET_MAX_PER_DAY:
+        key = next((k for pat, k in GREET_PATTERNS if pat.match(stripped)), None)
+        if key:
+            bump_greet(rec)
+            save(MEMBERS_FILE, members)
+            sticker = sticker_for(key)
+            try:
+                if sticker:
+                    await msg.reply_sticker(sticker)
+                else:
+                    await msg.reply_text(random.choice(GREET_BANK[key]))
+            except Exception:
                 try:
-                    if sticker:
-                        await msg.reply_sticker(sticker)
-                    else:
-                        await msg.reply_text(random.choice(bank))
+                    await msg.reply_text(random.choice(GREET_BANK[key]))
                 except Exception:
-                    try:
-                        await msg.reply_text(random.choice(bank))
-                    except Exception:
-                        pass
-                return
+                    pass
+            return
 
-    # 4. flood
-    stamps = _flood.setdefault(user.id, [])
-    now = time.time()
-    stamps.append(now)
-    _flood[user.id] = [t for t in stamps if now - t < FLOOD_SECONDS]
-    if len(_flood[user.id]) > FLOOD_MSGS:
-        _flood[user.id] = []
-        await punish(update, context, rec, "too many messages too fast")
-        return
+    # 4. flood — the team is exempt
+    if not is_mod:
+        stamps = _flood.setdefault(user.id, [])
+        now = time.time()
+        stamps.append(now)
+        _flood[user.id] = [t for t in stamps if now - t < FLOOD_SECONDS]
+        if len(_flood[user.id]) > FLOOD_MSGS:
+            _flood[user.id] = []
+            await punish(update, context, rec, "too many messages too fast")
+            return
 
     save(MEMBERS_FILE, members)
 
@@ -572,7 +606,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             and msg.reply_to_message.from_user.is_bot
         )
         mentioned = (bool(me) and f"@{me}" in text) or replied_to_bot
-        await echo_ai.consider_reply(update, context, mentioned, replied_to_bot)
+        # ECHO answers the team only when spoken to — otherwise Pop's own
+        # messages would generate drafts addressed back to Pop.
+        await echo_ai.consider_reply(
+            update, context, mentioned, replied_to_bot, only_if_addressed=is_mod
+        )
     except Exception as e:
         log.warning("echo_ai skipped: %s", e)
 
@@ -672,16 +710,30 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update.effective_chat.id, update.effective_user.id, context):
         return
     purge_expired()
+    # never dump held links back into the group — DM only, command wiped
+    in_group = update.effective_chat.type != "private"
+    if in_group:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+    uid = update.effective_user.id
     if not pending:
-        await update.message.reply_text("Nothing waiting.")
+        try:
+            await context.bot.send_message(uid, "Nothing waiting.")
+        except Exception:
+            pass
         return
     for token, p in list(pending.items())[:10]:
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Publish", callback_data=f"ok:{token}"),
             InlineKeyboardButton("🚫 Reject", callback_data=f"no:{token}"),
         ]])
-        await update.message.reply_text(
-            f"🔗 From: {p['name']}\n\n{p['text'][:900]}", reply_markup=kb)
+        try:
+            await context.bot.send_message(
+                uid, f"🔗 From: {p['name']}\n\n{p['text'][:900]}", reply_markup=kb)
+        except Exception as e:
+            log.warning("could not send pending item: %s", e)
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -977,14 +1029,30 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(chat.id, update.effective_user.id, context):
         return
     me = await context.bot.get_chat_member(chat.id, context.bot.id)
+
+    jobs = []
+    try:
+        for j in context.application.job_queue.jobs():
+            nxt = getattr(j, "next_t", None)
+            jobs.append(f"  {j.callback.__name__} -> {nxt}")
+    except Exception as e:
+        jobs.append(f"  job queue unavailable: {e}")
+
     await quiet_reply(update, context,
+        f"BUILD: {BUILD}\n"
         f"chat_id: {chat.id}\n"
+        f"can read group messages: {context.bot.can_read_all_group_messages}\n"
         f"bot status: {me.status}\n"
         f"can_delete: {getattr(me, 'can_delete_messages', None)}\n"
         f"can_restrict: {getattr(me, 'can_restrict_members', None)}\n"
         f"ADMIN_CHAT_ID set: {bool(ADMIN_CHAT_ID)}\n"
         f"GROUP_CHAT_ID set: {bool(GROUP_CHAT_ID)}\n"
+        f"generation: {'on' if echo_ai.API_KEY else 'OFF (no ANTHROPIC_API_KEY)'}"
+        f" | model: {echo_ai.MODEL}\n"
+        f"stickers loaded: {len(STICKER_INDEX)}\n"
         f"tracked: {len(members)} | memories: {len(answers)} | pending: {len(pending)}"
+        f" | drafts: {len(echo_ai.drafts)}\n"
+        "scheduled:\n" + ("\n".join(jobs) or "  none")
     )
 
 
@@ -1034,9 +1102,35 @@ def main():
 
     async def announce(app_):
         await load_stickers(app_)
+
+        # Privacy mode is the one setting that silently breaks half the bot:
+        # with it on, Telegram only shows the bot commands and direct replies,
+        # so greetings and moderation can never fire. Say so at boot.
+        try:
+            privacy_off = app_.bot.can_read_all_group_messages
+        except Exception:
+            privacy_off = None
+        group_ok = "not set"
+        if GROUP_CHAT_ID:
+            try:
+                c = await app_.bot.get_chat(GROUP_CHAT_ID)
+                group_ok = f"ok ({c.title})"
+            except Exception as e:
+                group_ok = f"UNREACHABLE — {e}"
         for admin_id in ADMIN_IDS:
             try:
-                await app_.bot.send_message(admin_id, "👁️ ECHO guardian is awake.")
+                await app_.bot.send_message(
+                    admin_id,
+                    f"👁️ ECHO guardian is awake.\n"
+                    f"build: {BUILD}\n"
+                    f"stickers: {len(STICKER_INDEX)}\n"
+                    f"generation: {'on' if echo_ai.API_KEY else 'OFF (no API key)'}\n"
+                    f"group: {group_ok}\n"
+                    f"can read group messages: {privacy_off}"
+                    + ("\n⚠️ privacy mode is ON — BotFather /setprivacy → Disable, "
+                       "then remove and re-add the bot to the group."
+                       if privacy_off is False else ""),
+                )
             except Exception:
                 pass
 
@@ -1045,7 +1139,7 @@ def main():
     activity_tracker.register(app)
     echo_ai.register(app)
 
-    log.info("ECHO guardian is awake.")
+    log.info("ECHO guardian is awake — build %s", BUILD)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 

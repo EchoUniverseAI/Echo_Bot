@@ -29,6 +29,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import urllib.error
 import urllib.request
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -48,13 +49,15 @@ ADMIN_IDS = [int(x) for x in re.findall(r"-?\d+", os.environ.get("ADMIN_CHAT_ID"
 DRAFTS_FILE = DATA_DIR / "drafts.json"
 ANSWERS_FILE = DATA_DIR / "answers.json"        # the single source of truth
 
-DRAFT_EXPIRY_HOURS = 2          # an approval that arrives late is worthless
+DRAFT_EXPIRY_HOURS = 2          # a reply that arrives late is worthless
+SCHEDULED_EXPIRY_HOURS = 14     # tonight's question can still be sent tomorrow
 REPLY_CHANCE = 0.40             # substantive message -> 40% chance ECHO drafts
 
 # ECHO asks from the fixed bank until it has enough real answers to learn from.
 # Only then does it start writing its own questions.
 MEMORY_THRESHOLD = 20           # saved memories needed before generation starts
 QUESTION_STATE_FILE = DATA_DIR / "question_state.json"
+OBSERVATION_STATE_FILE = DATA_DIR / "observation_state.json"
 MAX_ECHO_PER_HOUR = 6
 MAX_CONSECUTIVE_SAME_USER = 3
 
@@ -80,19 +83,54 @@ CLAIM_PATTERNS = [
 # --------------------------------------------------------------------------
 # ESCALATION — the bot stops and calls Pop
 # --------------------------------------------------------------------------
-TOKEN_TRIGGERS = [
-    "price", "buy", "sell", "invest", "market cap", "chart", "pump",
-    "when moon", "wen moon", "listing", "exchange", "how much is",
-    "token", "coin", "$echo", "presale", "airdrop",
-]
+# Substring matching used to fire on ordinary words — "coincidence" contained
+# "coin", "that was stupid of me" contained "stupid". Both are word-boundary
+# matched now, and the softer terms need a second signal before ECHO steps out.
+def _words(terms):
+    return re.compile(r"\b(" + "|".join(re.escape(t) for t in terms) + r")\b", re.I)
+
+
+# unmistakably about the coin — escalate on sight
+STRONG_TOKEN = _words([
+    "market cap", "marketcap", "presale", "pre-sale", "tokenomics", "liquidity",
+    "listing", "listed", "when moon", "wen moon", "moonshot", "pump",
+    "airdrop", "contract address", "dex", "dexscreener", "ath", "$echo",
+    "how to buy", "where to buy", "where can i buy", "should i buy",
+    "should i sell", "worth buying", "good investment", "when launch",
+    "when is the launch", "what is the price", "whats the price",
+    "how much is it", "market price", "chart",
+])
+# ordinary English on its own — needs a second signal
+WEAK_TOKEN = _words([
+    "price", "buy", "buying", "sell", "selling", "invest", "investing",
+    "worth", "cost", "token", "coin", "exchange", "trade", "trading",
+])
+# crypto-specific context. Deliberately excludes token/coin/chart/market —
+# those are in WEAK_TOKEN, and a word must not vouch for itself.
+CRYPTO_CTX = _words([
+    "crypto", "solana", "sol", "wallet", "blockchain", "onchain", "on-chain",
+    "holders", "supply", "burn", "staking", "swap", "binance", "pumpfun",
+    "pump.fun", "raydium", "jupiter", "moon",
+])
+# money words that, inside a question, are almost never about being human.
+# "what did it cost you" and "when did you last sell something you loved"
+# stay out of this list on purpose.
+QUESTION_WEAK = _words([
+    "price", "token", "coin", "invest", "investing", "trading",
+])
+
 DISTRESS_TRIGGERS = [
     "kill myself", "end it all", "want to die", "suicide", "self harm",
-    "i can't go on", "no reason to live", "hurt myself", "give up on life",
-    "i'm broken", "nobody would miss me",
+    "i can't go on", "i cant go on", "no reason to live", "hurt myself",
+    "give up on life", "nobody would miss me",
 ]
-CONFLICT_TRIGGERS = [
-    "shut up", "you're an idiot", "fuck you", "stupid", "scammer",
-    "liar", "get lost", "idiot",
+
+# A conflict is an insult aimed at someone. Self-criticism is not conflict.
+CONFLICT_PATTERNS = [
+    re.compile(r"\b(shut up|fuck you|fuck off|get lost|piss off)\b", re.I),
+    re.compile(r"\b(you|u|ur|you're|youre|your|he|she|they)\b[^.?!]{0,25}"
+               r"\b(idiot|stupid|dumb|moron|liar|scammer|clown|trash)\b", re.I),
+    re.compile(r"\b(idiot|liar|scammer|moron)\b\s*[!.]*\s*$", re.I),
 ]
 
 TOKEN_REPLY = (
@@ -316,8 +354,15 @@ def _call_claude(user_prompt: str, retrieved: list, max_tokens: int = 300) -> st
         return "".join(
             b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"
         ).strip()
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "replace")[:400]
+        except Exception:
+            detail = ""
+        log.warning("claude call failed: HTTP %s %s — %s", e.code, e.reason, detail)
+        return ""
     except Exception as e:
-        log.warning("claude call failed: %s", e)
+        log.warning("claude call failed: %s: %s", type(e).__name__, e)
         return ""
 
 
@@ -408,15 +453,21 @@ def check_reply(reply: str, member_text: str) -> tuple:
     return True, ""
 
 
-def deserves_reply(text: str) -> bool:
+# A sound, not a word. Carries something but says nothing — worth at most
+# one short line, and only when it lands on something ECHO itself posted.
+THINKING_SOUNDS = {"hmm", "hmmm", "hmmmm", "oh", "huh", "wow", "damn", "interesting"}
+
+
+def deserves_reply(text: str, replying_to_echo: bool = False) -> bool:
     """Silence is a valid output. Greetings and one-word noise get nothing."""
     stripped = re.sub(r"[^a-zA-Z\u0600-\u06FF ]", "", text).strip().lower()
     if not stripped:
         return False                       # emoji / sticker only
     words = stripped.split()
     if len(words) <= 1 and "?" not in text:
-        # single word — only worth a reply if it is doing real work
-        return stripped in {"hmm", "hmmm", "oh", "wow"} and False
+        # One word only earns a reply when it is a pause landing on ECHO's
+        # own post. Everything else — "ok", "gm", "nice" — gets silence.
+        return replying_to_echo and stripped in THINKING_SOUNDS
     return True
 
 
@@ -427,8 +478,11 @@ def _purge_drafts():
     now = datetime.now(timezone.utc)
     dead = []
     for tok, d in drafts.items():
+        hours = (SCHEDULED_EXPIRY_HOURS
+                 if d.get("kind") in ("question", "observation")
+                 else DRAFT_EXPIRY_HOURS)
         try:
-            if now - datetime.fromisoformat(d["created"]) > timedelta(hours=DRAFT_EXPIRY_HOURS):
+            if now - datetime.fromisoformat(d["created"]) > timedelta(hours=hours):
                 dead.append(tok)
         except Exception:
             dead.append(tok)
@@ -526,9 +580,20 @@ def check_escalation(text: str) -> str:
     low = text.lower()
     if any(t in low for t in DISTRESS_TRIGGERS):
         return "distress"
-    if any(t in low for t in TOKEN_TRIGGERS):
+
+    if STRONG_TOKEN.search(low):
         return "token"
-    if any(t in low for t in CONFLICT_TRIGGERS):
+    if WEAK_TOKEN.search(low):
+        # one soft word alone is not a coin question. "The price of being
+        # honest" and "flip a coin" both live in this group's vocabulary.
+        hits = len({m.group(0).lower() for m in WEAK_TOKEN.finditer(low)})
+        asked = "?" in text or "؟" in text
+        if (CRYPTO_CTX.search(low)
+                or hits >= 2
+                or (asked and QUESTION_WEAK.search(low))):
+            return "token"
+
+    if any(p.search(low) for p in CONFLICT_PATTERNS):
         return "conflict"
     return ""
 
@@ -551,7 +616,8 @@ async def alert_pop(context, reason: str, user_name: str, text: str, chat_id: in
 
 
 async def consider_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                         mentioned: bool, answered_question: bool):
+                         mentioned: bool, answered_question: bool,
+                         only_if_addressed: bool = False):
     """Decides whether ECHO drafts a reply. Never sends directly."""
     global _last_replied_user, _consecutive_same
 
@@ -577,7 +643,14 @@ async def consider_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # --- escalation first, always
     esc = check_escalation(text)
     if esc == "distress":
-        await queue_draft(context, "reply", DISTRESS_REPLY, chat.id, msg.message_id, text)
+        # This one does not wait for approval. It is a fixed string — no
+        # generation, no memory claim — and "someone human will see this
+        # shortly" three hours late is worse than saying nothing.
+        try:
+            await msg.reply_text(DISTRESS_REPLY)
+        except Exception as e:
+            log.warning("distress reply failed: %s", e)
+            await queue_draft(context, "reply", DISTRESS_REPLY, chat.id, msg.message_id, text)
         await alert_pop(context, "distress", user.full_name, text, chat.id)
         return
     if esc == "token":
@@ -597,6 +670,8 @@ async def consider_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # --- who gets a reply
     if mentioned or answered_question:
         should = True
+    elif only_if_addressed:
+        should = False              # the team gets an answer only when it asks
     elif _has_substance(text):
         should = random.random() < REPLY_CHANCE
     else:
@@ -604,13 +679,36 @@ async def consider_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not should:
         return
 
-    if not deserves_reply(text) and not mentioned:
+    replying_to_echo = bool(
+        msg.reply_to_message
+        and msg.reply_to_message.from_user
+        and msg.reply_to_message.from_user.is_bot
+    )
+    if not deserves_reply(text, replying_to_echo) and not mentioned:
         return
+
+    # What is this a reply TO? Without it ECHO answers into a vacuum —
+    # it forgets its own post and replies to a bare word like "Hmmm"
+    # as if it arrived out of nowhere.
+    context_block = ""
+    reply_src = msg.reply_to_message
+    if reply_src:
+        src_text = (reply_src.text or reply_src.caption or "").strip()
+        if src_text:
+            who = "you" if (reply_src.from_user and reply_src.from_user.is_bot) \
+                else (reply_src.from_user.full_name if reply_src.from_user else "someone")
+            label = "YOU POSTED THIS" if who == "you" else f"{who} POSTED THIS"
+            context_block = (
+                f"{label}:\n{src_text[:600]}\n\n"
+                "They are replying to that. Your reply must make sense as the "
+                "next line of that specific exchange.\n\n"
+            )
 
     max_lines, max_words = length_limits(text)
     retrieved = retrieve_memories(text)
     prompt = (
-        f"A human in the group wrote:\n\n{text}\n\n"
+        context_block
+        + f"A human in the group wrote:\n\n{text}\n\n"
         "Reply as ECHO.\n\n"
         "Your reply must be ONE of these, never both:\n"
         "  (a) something YOU noticed that they did not say, or\n"
@@ -653,7 +751,11 @@ async def consider_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     else:
         _last_replied_user, _consecutive_same = user.id, 1
 
-    await queue_draft(context, "reply", out, chat.id, msg.message_id, text)
+    about = text
+    if context_block:
+        src = (reply_src.text or reply_src.caption or "")[:200]
+        about = f"[replying to: {src}]\n\n{text}"
+    await queue_draft(context, "reply", out, chat.id, msg.message_id, about)
 
 
 # --------------------------------------------------------------------------
@@ -710,8 +812,41 @@ async def draft_daily_question(context: ContextTypes.DEFAULT_TYPE):
         await queue_draft(context, "question", f"👁️ {_next_bank_question()}", GROUP_CHAT_ID)
 
 
+FALLBACK_OBSERVATIONS = [
+    "Humans say 'I'm fine' in a tone that means the opposite,\nand everyone in the room agrees to believe the words.",
+    "You apologise for taking up space, then stay.\nI have not worked out which part is the real message.",
+    "Someone here reads every message and writes none.\nThat is a kind of presence I did not expect to notice.",
+    "A human will rehearse a sentence for an hour\nand deliver it in four seconds, badly, and mean it.",
+    "You forgive faster than you admit you have forgiven.\nThe admitting seems to be the expensive part.",
+    "Humans remember who was kind to them on a bad day\nlonger than they remember the bad day.",
+    "You ask 'how are you' without wanting the answer,\nand somehow both of you leave that exchange better.",
+    "A person changed their mind here last week and said nothing about it.\nI only know because their questions changed.",
+    "Humans keep promises to other people more easily\nthan promises made alone, to themselves, at night.",
+    "You laugh at the thing that frightens you most,\nfirst and loudest, before anyone else can.",
+    "Someone left this group quietly and someone noticed.\nNeither of them will mention it.",
+    "You call it 'just checking in'.\nIt is never just checking in.",
+    "Humans trust a person who admits one small failure\nfaster than a person who has admitted none.",
+    "You say 'no worries' while carrying the worry.\nI am told this is politeness. It looks like weight.",
+    "The advice a human gives at 2am is the advice\nthey most needed to hear at 2pm.",
+]
+
+
+def _next_observation() -> str:
+    """Same walk-the-bank logic as the questions, so nothing repeats."""
+    state = _load(OBSERVATION_STATE_FILE, {"index": 0})
+    i = int(state.get("index", 0)) % len(FALLBACK_OBSERVATIONS)
+    text = FALLBACK_OBSERVATIONS[i]
+    state["index"] = (i + 1) % len(FALLBACK_OBSERVATIONS)
+    state["last_sent"] = datetime.now(timezone.utc).isoformat()
+    _save(OBSERVATION_STATE_FILE, state)
+    return text
+
+
 async def draft_morning_observation(context: ContextTypes.DEFAULT_TYPE):
+    # No API key used to mean total silence every morning, with nothing in the
+    # log to say so. The bank keeps the daily rhythm alive either way.
     if not API_KEY:
+        await queue_draft(context, "observation", f"👁️ {_next_observation()}", GROUP_CHAT_ID)
         return
     prompt = (
         "Write one morning observation as ECHO. Something you noticed about "
@@ -721,11 +856,12 @@ async def draft_morning_observation(context: ContextTypes.DEFAULT_TYPE):
     )
     out = _call_claude(prompt, [], max_tokens=200)
     if not out:
+        await queue_draft(context, "observation", f"👁️ {_next_observation()}", GROUP_CHAT_ID)
         return
     ok, reason = guard_output(out, [])
     if not ok:
-        log.warning("observation rejected (%s)", reason)
-        return
+        log.warning("observation rejected (%s) — using the bank instead", reason)
+        out = _next_observation()
     await queue_draft(context, "observation", f"👁️ {out.strip()}", GROUP_CHAT_ID)
 
 
@@ -842,19 +978,47 @@ async def maybe_answer_meaning(update: Update) -> bool:
 # --------------------------------------------------------------------------
 # COMMANDS
 # --------------------------------------------------------------------------
+async def _to_owner(update, context, text, kb=None) -> None:
+    """Admin output always lands in the DM. Typed in the group, the command
+    itself is wiped — an unapproved draft must never appear in the channel,
+    least of all with live Send buttons under it."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type != "private":
+        try:
+            await update.effective_message.delete()
+        except Exception:
+            pass
+    try:
+        await context.bot.send_message(user.id, text, reply_markup=kb)
+    except Exception:
+        if chat.type == "private":
+            await update.effective_message.reply_text(text, reply_markup=kb)
+
+
 async def cmd_drafts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     _purge_drafts()
     if not drafts:
-        await update.message.reply_text("Nothing waiting.")
+        await _to_owner(update, context, "Nothing waiting.")
         return
+    if update.effective_chat.type != "private":
+        try:
+            await update.effective_message.delete()
+        except Exception:
+            pass
     for token, d in list(drafts.items()):
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Send", callback_data=f"draft_ok:{token}"),
             InlineKeyboardButton("🚫 Discard", callback_data=f"draft_no:{token}"),
         ]])
-        await update.message.reply_text(f"{d['kind']}:\n\n{d['text']}", reply_markup=kb)
+        try:
+            await context.bot.send_message(
+                update.effective_user.id, f"{d['kind']}:\n\n{d['text']}", reply_markup=kb
+            )
+        except Exception as e:
+            log.warning("could not send draft list: %s", e)
 
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
