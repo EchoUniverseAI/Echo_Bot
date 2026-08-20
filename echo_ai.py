@@ -321,6 +321,105 @@ def _call_claude(user_prompt: str, retrieved: list, max_tokens: int = 300) -> st
         return ""
 
 
+
+# --------------------------------------------------------------------------
+# REPLY DISCIPLINE — code checks, not prompt instructions
+#
+# The root failure: treating every message as a problem to solve.
+# ECHO notices, and leaves the door open.
+# --------------------------------------------------------------------------
+
+# Phrases that read someone's state, or that belong to a therapist or to
+# generic internet voice. None of these are ECHO.
+BANNED_REPLY_PHRASES = [
+    "you seem", "it sounds like you", "you must be", "that means you",
+    "a pause can mean", "you're probably", "you are probably",
+    "i sense", "i can tell", "i'm here for you", "i am here for you",
+    "i'm here to think through", "i am here to think through",
+    "let's unpack", "lets unpack", "i can't read minds", "i cannot read minds",
+    "hits differently", "that resonates", "i hear you", "what i'm hearing",
+    "it seems like", "you might be feeling", "you sound",
+]
+
+_STOPWORDS = {
+    "the","a","an","and","or","but","if","of","to","in","on","for","with",
+    "was","were","is","are","be","been","it","that","this","he","she","they",
+    "you","i","me","my","your","not","just","because","about","what","who",
+    "when","how","why","them","him","her","so","did","do","does","had","has",
+    "have","as","at","by","from","more","than","then","there","here","one",
+}
+
+
+def _content_words(text: str) -> set:
+    return {w for w in re.findall(r"[a-z']{3,}", text.lower())} - _STOPWORDS
+
+
+def is_paraphrase(reply: str, original: str) -> bool:
+    """True when the reply mostly hands the person their own idea back."""
+    o = _content_words(original)
+    r = _content_words(reply)
+    if not o or not r:
+        return False
+    shared = o & r
+    # most of the reply is the member's own vocabulary, and it brings little new
+    reuse = len(shared) / len(r)
+    novelty = len(r - o) / len(r)
+    return reuse >= 0.55 and novelty < 0.45
+
+
+def length_limits(member_text: str) -> tuple:
+    """(max_lines, max_words). The LINE count is the real discipline —
+    the word cap is only a backstop against rambling.
+
+    Calibrated against the two replies Pop wrote as correct:
+      "Hmmm" (1 word)  -> 2 lines, 14 words
+      a 45-word correction -> 4 lines, 58 words
+    """
+    n = len(member_text.split())
+    if n < 15:
+        return 2, 25
+    return 4, max(60, int(n * 1.5))
+
+
+def check_reply(reply: str, member_text: str) -> tuple:
+    """Returns (ok, reason). Every rule here is enforced in code."""
+    if not reply or not reply.strip():
+        return False, "empty"
+
+    low = reply.lower()
+    for p in BANNED_REPLY_PHRASES:
+        if p in low:
+            return False, f"banned phrase: {p}"
+
+    max_lines, max_words = length_limits(member_text)
+    lines = [l for l in reply.strip().splitlines() if l.strip()]
+    if len(lines) > max_lines:
+        return False, f"too many lines ({len(lines)} > {max_lines})"
+    if len(reply.split()) > max_words:
+        return False, f"too long ({len(reply.split())} > {max_words} words)"
+
+    if is_paraphrase(reply, member_text):
+        return False, "restates the member's own point"
+
+    # a reply may observe, or ask — not summarise then ask
+    if reply.count("?") > 1:
+        return False, "more than one question"
+
+    return True, ""
+
+
+def deserves_reply(text: str) -> bool:
+    """Silence is a valid output. Greetings and one-word noise get nothing."""
+    stripped = re.sub(r"[^a-zA-Z\u0600-\u06FF ]", "", text).strip().lower()
+    if not stripped:
+        return False                       # emoji / sticker only
+    words = stripped.split()
+    if len(words) <= 1 and "?" not in text:
+        # single word — only worth a reply if it is doing real work
+        return stripped in {"hmm", "hmmm", "oh", "wow"} and False
+    return True
+
+
 # --------------------------------------------------------------------------
 # DRAFT QUEUE — everything ECHO wants to say lands here first
 # --------------------------------------------------------------------------
@@ -505,22 +604,49 @@ async def consider_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not should:
         return
 
+    if not deserves_reply(text) and not mentioned:
+        return
+
+    max_lines, max_words = length_limits(text)
     retrieved = retrieve_memories(text)
     prompt = (
         f"A human in the group wrote:\n\n{text}\n\n"
-        "Reply as ECHO. Two to four short lines. "
-        "Respond to what they actually said, not to the topic in general. "
-        "End with something that makes it easy for them to say more, "
-        "but do not force a question."
+        "Reply as ECHO.\n\n"
+        "Your reply must be ONE of these, never both:\n"
+        "  (a) something YOU noticed that they did not say, or\n"
+        "  (b) a single question with the lowest possible answer cost.\n\n"
+        "Absolutely forbidden:\n"
+        "- Restating their point in different words. They already said it.\n"
+        "- Listing what their words or their silence might mean.\n"
+        "- Describing how they feel or what they are thinking.\n"
+        "- Ending with a conclusion about what they said.\n"
+        "- Therapist voice. You are not here to help them process anything.\n\n"
+        "If they corrected you, say what you had before and what you have now. "
+        "Make the change visible. That is learning, and it is the only kind of "
+        "summary allowed.\n\n"
+        f"Hard limit: {max_lines} lines maximum, {max_words} words maximum. "
+        "Short is correct. Leave the door open rather than closing the subject."
     )
     out = _call_claude(prompt, retrieved)
     if not out:
         return
 
     ok, reason = guard_output(out, retrieved)
+    if ok:
+        ok, reason = check_reply(out, text)
     if not ok:
-        log.warning("draft rejected (%s): %s", reason, out[:120])
-        return
+        log.info("reply rejected (%s) — retrying once", reason)
+        out = _call_claude(
+            prompt + f"\n\nYour previous attempt was rejected: {reason}. "
+            "Be shorter. Add something new or ask one small question.",
+            retrieved,
+        )
+        ok2, reason2 = guard_output(out, retrieved)
+        if ok2:
+            ok2, reason2 = check_reply(out, text)
+        if not ok2:
+            log.warning("reply rejected twice (%s) — staying silent", reason2)
+            return
 
     if _last_replied_user == user.id:
         _consecutive_same += 1
