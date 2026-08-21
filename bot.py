@@ -13,6 +13,7 @@ IMPORTANT SETUP (do these or the bot will look "broken"):
   3. Set BOT_TOKEN as an environment variable on your host.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -22,6 +23,8 @@ import uuid
 import time
 from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
+import urllib.error
+import urllib.request
 
 from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus
@@ -41,7 +44,7 @@ from telegram.ext import (
 # --------------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------------
-BUILD = "2026-08-20c"      # bump this on every deploy — /debug shows it
+BUILD = "2026-08-21a"      # bump this on every deploy — /debug shows it
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
@@ -52,6 +55,17 @@ ADMIN_CHAT_ID = ADMIN_IDS[0] if ADMIN_IDS else 0  # first one is primary
 PENDING_EXPIRY_HOURS = 24   # unreviewed link requests expire after this
 DAILY_QUESTION_HOUR = 18    # local hour (UTC) to post the daily question
 GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", "0"))  # for the daily question
+
+# --- the bridge to ECHO's memory service (see SPEC — /toecho) --------------
+# /toecho sends ONE message's text to the memory service, which extracts a
+# lesson from it. No name, no username, no id ever leaves this bot.
+ECHO_BRIDGE_URL = os.environ.get(
+    "ECHO_BRIDGE_URL",
+    "https://echo-universe-api.netlify.app/.netlify/functions/telegram",
+)
+ECHO_BRIDGE_KEY = os.environ.get("ECHO_BRIDGE_KEY", "")
+BRIDGE_TIMEOUT = 30         # Claude extraction on the other side takes seconds
+BRIDGE_MIN_CHARS = 15
 
 # Links from these domains post immediately, no review needed.
 SAFE_DOMAINS = {
@@ -745,6 +759,113 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --------------------------------------------------------------------------
+# /toecho — hand one message to ECHO's memory service
+#
+# Runs on a worker thread: the service calls a model and can take seconds,
+# and the bot must keep answering the group while it waits.
+# Nothing is written to answers.json — that store stays local and separate.
+# --------------------------------------------------------------------------
+def _bridge_post(text: str) -> tuple:
+    """(status, payload_or_error). Blocking — always called via to_thread."""
+    body = json.dumps({"source": text, "origin": "telegram-group"}).encode("utf-8")
+    req = urllib.request.Request(
+        ECHO_BRIDGE_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "x-echo-bridge-key": ECHO_BRIDGE_KEY,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=BRIDGE_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            try:
+                return resp.status, json.loads(raw)
+            except Exception:
+                return resp.status, {"ok": False, "error": raw[:200]}
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        return e.code, {"ok": False, "error": detail or e.reason}
+    except Exception as e:
+        return 0, {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+async def cmd_toecho(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply /toecho to a message worth teaching ECHO. Owner accounts only."""
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        return                                   # silent for everyone else
+
+    msg = update.effective_message
+    in_group = update.effective_chat.type != "private"
+
+    async def dm(text):
+        try:
+            await context.bot.send_message(user.id, text)
+        except Exception:
+            if not in_group:
+                try:
+                    await msg.reply_text(text)
+                except Exception:
+                    pass
+
+    # the group never sees this happening
+    if in_group:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+    target = msg.reply_to_message
+    if not target:
+        await dm("Reply to a message with /toecho.")
+        return
+
+    text = (target.text or target.caption or "").strip()
+    if len(text) < BRIDGE_MIN_CHARS:
+        await dm("Message too short to teach.")
+        return
+
+    if not ECHO_BRIDGE_KEY:
+        await dm("ECHO_BRIDGE_KEY is not set on Railway. Nothing was sent.")
+        return
+
+    try:
+        status, data = await asyncio.to_thread(_bridge_post, text)
+    except Exception as e:                       # must never take the bot down
+        log.warning("bridge call failed: %s", e)
+        await dm(f"Could not reach ECHO's memory. {e}")
+        return
+
+    if status == 401:
+        await dm("Bridge key rejected. Check ECHO_BRIDGE_KEY.")
+        return
+
+    if status and 200 <= status < 300 and isinstance(data, dict) and data.get("ok"):
+        held = ""
+        if data.get("count") is not None and data.get("max") is not None:
+            held = f"\n\n{data['count']}/{data['max']} memories held"
+        await dm(
+            f"MEMORY UPDATED — {data.get('id', '?')}\n\n"
+            f"I believed: {data.get('believed', '')}\n"
+            f"I learned: {data.get('learned', '')}{held}"
+        )
+        log.info("toecho stored %s", data.get("id"))
+        return
+
+    err = (data or {}).get("error", "")
+    if str(err).strip().lower() == "no lesson found":
+        await dm("Nothing worth remembering in that message.")
+        return
+
+    await dm(f"Could not reach ECHO's memory. {err or f'HTTP {status}'}")
+
+
+# --------------------------------------------------------------------------
 # COMMANDS
 # --------------------------------------------------------------------------
 async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1047,6 +1168,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"can_restrict: {getattr(me, 'can_restrict_members', None)}\n"
         f"ADMIN_CHAT_ID set: {bool(ADMIN_CHAT_ID)}\n"
         f"GROUP_CHAT_ID set: {bool(GROUP_CHAT_ID)}\n"
+        f"ECHO_BRIDGE_KEY set: {bool(ECHO_BRIDGE_KEY)}\n"
         f"generation: {'on' if echo_ai.API_KEY else 'OFF (no ANTHROPIC_API_KEY)'}"
         f" | model: {echo_ai.MODEL}\n"
         f"stickers loaded: {len(STICKER_INDEX)}\n"
@@ -1076,6 +1198,7 @@ def main():
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("stickers", cmd_stickers))
+    app.add_handler(CommandHandler("toecho", cmd_toecho))
     app.add_handler(CallbackQueryHandler(on_approval, pattern=r"^(ok|no):"))
 
     app.add_handler(MessageHandler(

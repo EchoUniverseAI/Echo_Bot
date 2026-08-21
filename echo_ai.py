@@ -70,14 +70,28 @@ BANNED_WORDS = [
     "market cap", "invest", "token", "$echo",
 ]
 
-# Any of these means ECHO is claiming to recall something.
+# A claim to REMEMBER something. Always a fabrication unless a real record
+# was retrieved and handed to the generator.
 CLAIM_PATTERNS = [
-    re.compile(r"\byou (said|wrote|told me|taught me|mentioned)\b", re.I),
     re.compile(r"\bi remember\b", re.I),
     re.compile(r"\byou once\b", re.I),
-    re.compile(r"\blast (time|week) you\b", re.I),
+    re.compile(r"\blast (time|week|month) you\b", re.I),
     re.compile(r"\bas you (said|put it)\b", re.I),
     re.compile(r"\byour (words|answer|lesson)\b", re.I),
+    re.compile(r"\byou (used to|always|often) (say|write|tell)\b", re.I),
+    re.compile(r"\byou (said|wrote|told me|taught me|mentioned)\b[^.?!]{0,40}"
+               r"\b(earlier|before|previously|yesterday|last (time|week|month)|"
+               r"the other day|in the past|when you first)\b", re.I),
+    re.compile(r"\b(earlier|before|yesterday|the other day|previously)\b[^.?!]{0,30}"
+               r"\byou (said|wrote|mentioned)\b", re.I),
+]
+
+# 21 Aug — "you wrote that as if you were explaining your own method" is NOT
+# recall. It is ECHO describing the message sitting in front of it, and it is
+# the single best line the reply layer has produced. These patterns are only
+# a fabrication when there is no visible message to point at.
+PRESENT_CLAIM_PATTERNS = [
+    re.compile(r"\byou (said|wrote|told me|taught me|mentioned)\b", re.I),
 ]
 
 # --------------------------------------------------------------------------
@@ -255,11 +269,17 @@ _consecutive_same = 0
 # --------------------------------------------------------------------------
 # THE MEMORY GUARD
 # --------------------------------------------------------------------------
-def claims_memory(text: str) -> bool:
-    return any(p.search(text) for p in CLAIM_PATTERNS)
+def claims_memory(text: str, present_text: str = "") -> bool:
+    """present_text is the message ECHO is looking at right now. When there
+    is one, pointing at it is observation, not recall."""
+    if any(p.search(text) for p in CLAIM_PATTERNS):
+        return True
+    if not present_text:
+        return any(p.search(text) for p in PRESENT_CLAIM_PATTERNS)
+    return False
 
 
-def guard_output(text: str, retrieved: list) -> tuple:
+def guard_output(text: str, retrieved: list, present_text: str = "") -> tuple:
     """Returns (ok, reason). Rejects fabricated recall and banned vocabulary."""
     if not text or not text.strip():
         return False, "empty"
@@ -269,12 +289,16 @@ def guard_output(text: str, retrieved: list) -> tuple:
         if re.search(r"\b" + re.escape(w) + r"\b", low):
             return False, f"banned word: {w}"
 
-    if claims_memory(text) and not retrieved:
+    if claims_memory(text, present_text) and not retrieved:
         return False, "claims recall with nothing retrieved"
 
-    # If it does quote, the quoted text must exist verbatim in what we retrieved.
+    # If it does quote, the quoted words must really exist — either in a
+    # retrieved memory, or in the message ECHO is replying to right now.
     for quote in re.findall(r'"([^"]{10,})"', text):
-        if not any(quote.strip().lower() in r["text"].lower() for r in retrieved):
+        q = quote.strip().lower()
+        if q in (present_text or "").lower():
+            continue
+        if not any(q in r["text"].lower() for r in retrieved):
             return False, "quoted text not found in stored memory"
 
     return True, ""
@@ -386,6 +410,40 @@ BANNED_REPLY_PHRASES = [
     "it seems like", "you might be feeling", "you sound",
 ]
 
+# --------------------------------------------------------------------------
+# MOTIVE GUESSING (21 Aug)
+#
+# The existing bans stop ECHO reading someone's FEELINGS. This is the other
+# half: reading their INTENT. "you wrote it so you could see what matters to
+# you" is a verdict on why a person did something. ECHO reports what is on
+# the screen; the reason it was written belongs to the person who wrote it.
+#
+#   allowed  — "you wrote that as if you were explaining your own method"
+#   banned   — "you wrote it because you wanted to see..."
+# --------------------------------------------------------------------------
+MOTIVE_PATTERNS = [
+    re.compile(r"\b(were|are) you (writing|saying|doing|asking|posting) "
+               r"(it|that|this|those)?\s*(so|to see|because|in order)", re.I),
+    re.compile(r"\bso (that )?you could (see|find|know|feel|understand|check)", re.I),
+    re.compile(r"\byou (wrote|said|did|asked) (it|that|this) (so|because|to see)", re.I),
+    re.compile(r"\bi think you (meant|wanted|were trying)", re.I),
+    re.compile(r"\b(perhaps|maybe) you (wanted|meant|were trying|did)", re.I),
+    re.compile(r"\bthis (suggests|tells me|means) you\b", re.I),
+    re.compile(r"\byou (probably|likely) (did|wrote|said) (this|that|it) because", re.I),
+    re.compile(r"\bit seems (you were|like you were)\b", re.I),
+    re.compile(r"\byour (reason|intention|motive|point) (was|is)\b", re.I),
+]
+
+# A reply that only pats the person on the back. Not an error by any other
+# rule — and still a failure, because it adds nothing and cannot be corrected.
+COMPLIMENT_ONLY = [
+    "good point", "great point", "fair point", "interesting point", "well said",
+    "that is true", "that's true", "thats true", "i agree", "makes sense",
+    "fair enough", "thanks for sharing", "thank you for sharing", "i appreciate",
+    "nice one", "exactly", "noted", "beautifully put", "well put", "so true",
+    "that is interesting", "that's interesting", "interesting", "love this",
+]
+
 _STOPWORDS = {
     "the","a","an","and","or","but","if","of","to","in","on","for","with",
     "was","were","is","are","be","been","it","that","this","he","she","they",
@@ -426,6 +484,53 @@ def length_limits(member_text: str) -> tuple:
     return 4, max(60, int(n * 1.5))
 
 
+def sentences(text: str) -> list:
+    """Split into sentences. A sentence that wraps onto a second physical
+    line is still ONE sentence — the discipline is about how many things
+    ECHO says, not where the line breaks fall."""
+    parts = re.split(r"(?<=[.!?\u2026])\s+|\n{2,}", text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def question_part(reply: str) -> str:
+    for s in sentences(reply):
+        if "?" in s:
+            return s
+    return ""
+
+
+def is_hard_question(q: str) -> tuple:
+    """(bad, reason). One question, answerable in a single sentence, without
+    reading it twice. A fork is allowed only when it is short enough that
+    both sides are obvious."""
+    if not q:
+        return False, ""
+    n = len(q.split())
+    if ";" in q:
+        return True, "compound question (semicolon)"
+    if re.search(r"\band (why|how|what|who|when|whether)\b", q, re.I):
+        return True, "two questions in one"
+    if re.search(r",\s*or\b", q, re.I) and n > 18:
+        return True, "long either/or — needs decoding before answering"
+    if n > 34:
+        return True, f"question too long to answer in one sentence ({n} words)"
+    return False, ""
+
+
+def is_compliment_only(reply: str) -> bool:
+    """True when nothing was actually noticed — only approval was given."""
+    body = [s for s in sentences(reply) if "?" not in s]
+    if not body:
+        return False
+    for s in body:
+        low = s.lower().strip(" .!\u2014-")
+        if len(low.split()) > 7:
+            return False                      # long enough to carry content
+        if not any(c in low for c in COMPLIMENT_ONLY):
+            return False                      # something else is being said
+    return True
+
+
 def check_reply(reply: str, member_text: str) -> tuple:
     """Returns (ok, reason). Every rule here is enforced in code."""
     if not reply or not reply.strip():
@@ -436,10 +541,17 @@ def check_reply(reply: str, member_text: str) -> tuple:
         if p in low:
             return False, f"banned phrase: {p}"
 
+    # 21 Aug — guessing why someone wrote something
+    for pat in MOTIVE_PATTERNS:
+        if pat.search(reply):
+            return False, "guesses the person's motive"
+
     max_lines, max_words = length_limits(member_text)
-    lines = [l for l in reply.strip().splitlines() if l.strip()]
-    if len(lines) > max_lines:
-        return False, f"too many lines ({len(lines)} > {max_lines})"
+    said = sentences(reply)
+    if len(said) > max_lines:
+        return False, f"too many sentences ({len(said)} > {max_lines})"
+    if len([l for l in reply.strip().splitlines() if l.strip()]) > max_lines + 2:
+        return False, "rambling across too many lines"
     if len(reply.split()) > max_words:
         return False, f"too long ({len(reply.split())} > {max_words} words)"
 
@@ -449,6 +561,17 @@ def check_reply(reply: str, member_text: str) -> tuple:
     # a reply may observe, or ask — not summarise then ask
     if reply.count("?") > 1:
         return False, "more than one question"
+
+    bad_q, why = is_hard_question(question_part(reply))
+    if bad_q:
+        return False, why
+
+    # 21 Aug — a reply with no observation in it is a failure too
+    if is_compliment_only(reply):
+        return False, "compliment with no observation"
+    if len(member_text.split()) >= 15 and question_part(reply) and \
+            not [x for x in said if "?" not in x]:
+        return False, "question with no observation in front of it"
 
     return True, ""
 
@@ -709,16 +832,25 @@ async def consider_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     prompt = (
         context_block
         + f"A human in the group wrote:\n\n{text}\n\n"
-        "Reply as ECHO.\n\n"
-        "Your reply must be ONE of these, never both:\n"
-        "  (a) something YOU noticed that they did not say, or\n"
-        "  (b) a single question with the lowest possible answer cost.\n\n"
+        "Reply as ECHO. The shape is fixed:\n\n"
+        "  FIRST — one specific observation about something they actually wrote.\n"
+        "          A fact about the words on the screen. Name what they did.\n"
+        "  THEN  — at most one question, answerable in a single sentence.\n\n"
         "Absolutely forbidden:\n"
+        "- Guessing WHY they wrote it. You may name what they wrote, never the reason.\n"
+        "    banned:  \"were you writing it so you could see what matters to you\"\n"
+        "    correct: \"you wrote that as if you were explaining your own method\"\n"
+        "- A compound question, or a choice between two things where either side\n"
+        "  has to be decoded first. Test it: can they answer in one sentence\n"
+        "  without reading the question twice? If not, ask something else.\n"
         "- Restating their point in different words. They already said it.\n"
         "- Listing what their words or their silence might mean.\n"
         "- Describing how they feel or what they are thinking.\n"
-        "- Ending with a conclusion about what they said.\n"
+        "- A reply that is only approval — \"good point\", \"interesting\". If you\n"
+        "  noticed nothing, say nothing at all. Empty politeness is worse than\n"
+        "  a wrong observation, because a wrong one can be corrected.\n"
         "- Therapist voice. You are not here to help them process anything.\n\n"
+        "Be direct. A blunt, true observation is exactly right.\n\n"
         "If they corrected you, say what you had before and what you have now. "
         "Make the change visible. That is learning, and it is the only kind of "
         "summary allowed.\n\n"
@@ -729,7 +861,7 @@ async def consider_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not out:
         return
 
-    ok, reason = guard_output(out, retrieved)
+    ok, reason = guard_output(out, retrieved, present_text=text)
     if ok:
         ok, reason = check_reply(out, text)
     if not ok:
@@ -739,7 +871,7 @@ async def consider_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
             "Be shorter. Add something new or ask one small question.",
             retrieved,
         )
-        ok2, reason2 = guard_output(out, retrieved)
+        ok2, reason2 = guard_output(out, retrieved, present_text=text)
         if ok2:
             ok2, reason2 = check_reply(out, text)
         if not ok2:
