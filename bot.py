@@ -44,7 +44,7 @@ from telegram.ext import (
 # --------------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------------
-BUILD = "2026-08-21a"      # bump this on every deploy — /debug shows it
+BUILD = "2026-08-21b"      # bump this on every deploy — /debug shows it
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
@@ -174,6 +174,37 @@ async def is_admin(chat_id, user_id, context) -> bool:
         _admin_cache[chat_id] = (time.time() + 300, ids)
         cached = _admin_cache[chat_id]
     return user_id in cached[1]
+
+
+async def may_run_admin_cmd(update, context) -> bool:
+    """Owner accounts are authorised anywhere — including the DM.
+
+    is_admin() alone cannot answer this in a private chat: getChatAdministrators
+    on a one-to-one chat fails, the result is an empty set, and every admin
+    command using it went silent in DM. That is why /debug and /stats appeared
+    dead there.
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        return False
+    if user.id in ADMIN_IDS:
+        return True
+    if chat.type == "private":
+        # a group admin who is not an owner: check against the real group
+        if GROUP_CHAT_ID:
+            return await is_admin(GROUP_CHAT_ID, user.id, context)
+        return False
+    return await is_admin(chat.id, user.id, context)
+
+
+def diagnostic_chat(update) -> int:
+    """Which chat the diagnostics are actually about. Asked in the DM, the
+    interesting chat is never the DM — it is the group."""
+    chat = update.effective_chat
+    if chat.type == "private" and GROUP_CHAT_ID:
+        return GROUP_CHAT_ID
+    return chat.id
 
 
 async def delete_later(context: ContextTypes.DEFAULT_TYPE):
@@ -882,11 +913,14 @@ async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """The number that actually matters: who is really alive in here."""
-    chat = update.effective_chat
-    if not await is_admin(chat.id, update.effective_user.id, context):
+    if not await may_run_admin_cmd(update, context):
         return
 
-    total = await context.bot.get_chat_member_count(chat.id)
+    target = diagnostic_chat(update)
+    try:
+        total = await context.bot.get_chat_member_count(target)
+    except Exception as e:
+        total = f"unknown ({e})"
     now = datetime.now(timezone.utc)
     spoke_ever = spoke_7d = spoke_24h = 0
     for rec in members.values():
@@ -1146,10 +1180,21 @@ async def cmd_stickers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Diagnostics for admins."""
-    chat = update.effective_chat
-    if not await is_admin(chat.id, update.effective_user.id, context):
+    if not await may_run_admin_cmd(update, context):
         return
-    me = await context.bot.get_chat_member(chat.id, context.bot.id)
+
+    chat = update.effective_chat
+    target = diagnostic_chat(update)
+    # never let a failed probe kill the whole report — the report is the point
+    status = can_delete = can_restrict = None
+    probe_error = ""
+    try:
+        me = await context.bot.get_chat_member(target, context.bot.id)
+        status = me.status
+        can_delete = getattr(me, "can_delete_messages", None)
+        can_restrict = getattr(me, "can_restrict_members", None)
+    except Exception as e:
+        probe_error = f"{type(e).__name__}: {e}"
 
     jobs = []
     try:
@@ -1161,11 +1206,13 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await quiet_reply(update, context,
         f"BUILD: {BUILD}\n"
-        f"chat_id: {chat.id}\n"
+        f"this chat: {chat.id} ({chat.type})\n"
+        f"reporting on: {target}\n"
         f"can read group messages: {context.bot.can_read_all_group_messages}\n"
-        f"bot status: {me.status}\n"
-        f"can_delete: {getattr(me, 'can_delete_messages', None)}\n"
-        f"can_restrict: {getattr(me, 'can_restrict_members', None)}\n"
+        + (f"bot status: {status}\n"
+           f"can_delete: {can_delete}\n"
+           f"can_restrict: {can_restrict}\n"
+           if not probe_error else f"group probe FAILED: {probe_error}\n") +
         f"ADMIN_CHAT_ID set: {bool(ADMIN_CHAT_ID)}\n"
         f"GROUP_CHAT_ID set: {bool(GROUP_CHAT_ID)}\n"
         f"ECHO_BRIDGE_KEY set: {bool(ECHO_BRIDGE_KEY)}\n"
