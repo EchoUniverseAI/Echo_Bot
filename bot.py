@@ -44,7 +44,7 @@ from telegram.ext import (
 # --------------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------------
-BUILD = "2026-08-21b"      # bump this on every deploy — /debug shows it
+BUILD = "2026-08-21c"      # bump this on every deploy — /debug shows it
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
@@ -63,7 +63,29 @@ ECHO_BRIDGE_URL = os.environ.get(
     "ECHO_BRIDGE_URL",
     "https://echo-universe-api.netlify.app/.netlify/functions/telegram",
 )
-ECHO_BRIDGE_KEY = os.environ.get("ECHO_BRIDGE_KEY", "")
+def _clean_secret(value: str) -> str:
+    """Railway values arrive with whatever the clipboard carried. A trailing
+    newline or a pair of quotes is invisible in the dashboard and produces a
+    401 that looks exactly like a wrong key."""
+    v = (value or "").strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("\"", "'"):
+        v = v[1:-1].strip()
+    return v
+
+
+ECHO_BRIDGE_KEY = _clean_secret(os.environ.get("ECHO_BRIDGE_KEY", ""))
+_RAW_BRIDGE_KEY = os.environ.get("ECHO_BRIDGE_KEY", "")
+
+
+def bridge_key_fingerprint() -> str:
+    """Enough to compare against Netlify by eye; never the key itself."""
+    k = ECHO_BRIDGE_KEY
+    if not k:
+        return "not set"
+    shape = f"{len(k)} chars, {k[:3]}…{k[-3:]}"
+    if _RAW_BRIDGE_KEY != k:
+        shape += "  ⚠️ had stray spaces/quotes — trimmed"
+    return shape
 BRIDGE_TIMEOUT = 30         # Claude extraction on the other side takes seconds
 BRIDGE_MIN_CHARS = 15
 
@@ -872,8 +894,14 @@ async def cmd_toecho(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await dm(f"Could not reach ECHO's memory. {e}")
         return
 
-    if status == 401:
-        await dm("Bridge key rejected. Check ECHO_BRIDGE_KEY.")
+    if status in (401, 403):
+        detail = str((data or {}).get("error", "")).strip()[:200]
+        await dm(
+            "Bridge key rejected. Check ECHO_BRIDGE_KEY.\n\n"
+            f"Bot is sending: {bridge_key_fingerprint()}\n"
+            + (f"Service said: {detail}" if detail else
+               "The service returned no detail.")
+        )
         return
 
     if status and 200 <= status < 300 and isinstance(data, dict) and data.get("ok"):
@@ -1215,7 +1243,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
            if not probe_error else f"group probe FAILED: {probe_error}\n") +
         f"ADMIN_CHAT_ID set: {bool(ADMIN_CHAT_ID)}\n"
         f"GROUP_CHAT_ID set: {bool(GROUP_CHAT_ID)}\n"
-        f"ECHO_BRIDGE_KEY set: {bool(ECHO_BRIDGE_KEY)}\n"
+        f"ECHO_BRIDGE_KEY: {bridge_key_fingerprint()}\n"
         f"generation: {'on' if echo_ai.API_KEY else 'OFF (no ANTHROPIC_API_KEY)'}"
         f" | model: {echo_ai.MODEL}\n"
         f"stickers loaded: {len(STICKER_INDEX)}\n"
