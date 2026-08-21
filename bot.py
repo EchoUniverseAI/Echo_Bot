@@ -44,7 +44,7 @@ from telegram.ext import (
 # --------------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------------
-BUILD = "2026-08-21c"      # bump this on every deploy — /debug shows it
+BUILD = "2026-08-21d"      # bump this on every deploy — /debug shows it
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
@@ -847,6 +847,85 @@ def _bridge_post(text: str) -> tuple:
         return 0, {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+def _bridge_probe(header_name: str, value: str) -> tuple:
+    """One request with one header spelling. Uses text with no lesson in it,
+    so a success stores nothing."""
+    body = json.dumps({"source": "connection test", "origin": "telegram-group"}).encode()
+    req = urllib.request.Request(
+        ECHO_BRIDGE_URL, data=body,
+        headers={"Content-Type": "application/json", header_name: value},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace")[:120]
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read().decode("utf-8", "replace")[:120]
+        except Exception:
+            return e.code, str(e.reason)[:120]
+    except Exception as e:
+        return 0, f"{type(e).__name__}: {e}"[:120]
+
+
+async def cmd_bridgetest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Which side is wrong: the key, or the header it travels in?
+
+    Sends the same request four ways. If one of them is accepted, the key is
+    fine and the service is reading a different header. If all four are
+    rejected, the value the service holds is not the value we are sending —
+    which on Netlify usually means the function was never redeployed after
+    the variable was added.
+    """
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        return
+    in_group = update.effective_chat.type != "private"
+    if in_group:
+        try:
+            await update.effective_message.delete()
+        except Exception:
+            pass
+
+    async def dm(text):
+        try:
+            await context.bot.send_message(user.id, text)
+        except Exception:
+            pass
+
+    if not ECHO_BRIDGE_KEY:
+        await dm("ECHO_BRIDGE_KEY is not set on Railway.")
+        return
+
+    await dm(f"Testing the bridge four ways.\nKey: {bridge_key_fingerprint()}\n"
+             f"URL: {ECHO_BRIDGE_URL}")
+
+    variants = [
+        ("x-echo-bridge-key", ECHO_BRIDGE_KEY),
+        ("X-Echo-Bridge-Key", ECHO_BRIDGE_KEY),
+        ("authorization", f"Bearer {ECHO_BRIDGE_KEY}"),
+        ("x-api-key", ECHO_BRIDGE_KEY),
+    ]
+    lines = []
+    for name, value in variants:
+        status, body = await asyncio.to_thread(_bridge_probe, name, value)
+        verdict = "ACCEPTED" if status and 200 <= status < 300 else "rejected"
+        lines.append(f"{name}: HTTP {status} — {verdict}\n    {body}")
+
+    accepted = [l for l in lines if "ACCEPTED" in l]
+    if accepted and accepted[0].startswith("x-echo-bridge-key"):
+        tail = ("\n\nThe bridge is open. Try /toecho again on a real message.")
+    elif accepted:
+        tail = ("\n\nOne spelling works, but not the one in the spec. The key is "
+                "correct — the service is reading a different header. Tell me "
+                "which line said ACCEPTED and I will switch the bot to it.")
+    else:
+        tail = ("\n\nAll four rejected. The key is not the problem's shape — "
+                "the value the service holds differs from ours. On Netlify an "
+                "environment variable does not reach a function until the site "
+                "is redeployed, and it must be scoped to Production.")
+    await dm("\n\n".join(lines) + tail)
+
+
 async def cmd_toecho(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reply /toecho to a message worth teaching ECHO. Owner accounts only."""
     user = update.effective_user
@@ -1274,6 +1353,7 @@ def main():
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("stickers", cmd_stickers))
     app.add_handler(CommandHandler("toecho", cmd_toecho))
+    app.add_handler(CommandHandler("bridgetest", cmd_bridgetest))
     app.add_handler(CallbackQueryHandler(on_approval, pattern=r"^(ok|no):"))
 
     app.add_handler(MessageHandler(
